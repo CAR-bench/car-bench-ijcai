@@ -180,8 +180,10 @@ def main():
 
     sink = None if args.show_logs or args.serve_only else subprocess.DEVNULL
     parent_bin = str(Path(sys.executable).parent)
+    src_dir = str(Path(__file__).parent.parent)
     base_env = os.environ.copy()
     base_env["PATH"] = parent_bin + os.pathsep + base_env.get("PATH", "")
+    base_env["PYTHONPATH"] = src_dir + os.pathsep + base_env.get("PYTHONPATH", "")
 
     procs = []
     process_infos = []

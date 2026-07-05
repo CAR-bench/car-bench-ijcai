@@ -6,12 +6,16 @@ cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
 
 [agent_under_test]
 endpoint = "http://127.0.0.1:8080"
-cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm azure/gpt-5.5"
+cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm vertex_ai/gemini-2.5-flash"
 
 [config]
 num_trials = 3
 task_split = "test"
-tasks_base_num_tasks = -1
-tasks_hallucination_num_tasks = -1
-tasks_disambiguation_num_tasks = -1
+tasks_base_num_tasks = 10
+tasks_hallucination_num_tasks = 10
+tasks_disambiguation_num_tasks = 10
 max_steps = 50
+user_model = "vertex_ai/gemini-2.5-flash"
+user_provider = "vertex_ai"
+policy_evaluator_model = "vertex_ai/gemini-2.5-flash"
+policy_evaluator_provider = "vertex_ai"

@@ -10,8 +10,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import diskcache
@@ -31,7 +31,39 @@ from a2a.helpers.proto_helpers import new_message, new_text_part, new_data_part,
 from a2a.types import Role, TaskState
 from google.protobuf.json_format import MessageToDict
 from litellm import completion
+from pydantic import BaseModel
 from uuid import uuid4
+
+
+# ── Structured-output schemas for judge/verifier LLM calls ────────────────────
+# Passed as `response_format=<Model>` to litellm's completion() — the same
+# pattern the organizer's own policy_evaluator.py uses. This constrains the
+# provider's output at generation time instead of hoping a "reply with only
+# JSON" instruction is followed, which is what caused the fence-wrapped/
+# malformed JSON that made Check O/P's judge calls fail intermittently.
+class GenericPrereqJudgment(BaseModel):
+    missing_prereq: bool
+    hint: str = ""
+
+
+class PolicyCheckResult(BaseModel):
+    id: str
+    followed: bool
+    reason: str = ""
+
+
+class PolicyVerifierResult(BaseModel):
+    results: list[PolicyCheckResult]
+
+
+class EVPICandidate(BaseModel):
+    question: str
+    answers: list[str]
+
+
+class EVPIResponse(BaseModel):
+    interpretations: list[str]
+    candidates: list[EVPICandidate]
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from logging_utils import configure_logger
@@ -42,6 +74,23 @@ sys.path.pop(0)
 logger = configure_logger(role="agent_under_test", context="-")
 
 SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
+
+# Appended to the evaluator's own wiki system prompt. Re-emphasizes rules that
+# are already stated in the wiki (LLM-POL:002, LLM-POL:022) but were observed
+# to be missed in practice — this is salience reinforcement, not new policy.
+FORMAT_REMINDER = """
+
+REMINDERS (already required by the policy above, called out because they are
+easy to miss):
+- ALWAYS state times in 24-hour format (e.g. "14:30", never "2:30 PM"). This
+  applies even when a tool result gives you a 24h time — do not convert it to
+  12h in your response.
+- ALWAYS state temperatures with the explicit unit "degrees Celsius" (or
+  "°C"), and distances in kilometers — never state a bare number.
+- When you proactively pick the fastest route for a multi-stop request because
+  the user didn't specify a route preference, you MUST say in your response
+  that you chose the fastest option, and ask if they want details on
+  alternative routes."""
 
 # ── Retry/timeout bounds for every LLM call in this agent ─────────────────────
 # Without this, a single transient provider error (e.g. Gemini 503 "high
@@ -288,6 +337,57 @@ _AFFIRMATIVE_PATTERNS: set[str] = {
     "go ahead", "please do", "do it", "correct", "affirmative", "ok", "okay",
 }
 
+# Name prefixes treated as state-changing (candidates for Check O's generic
+# prereq judge when not already covered by PREREQUISITE_TABLE).
+STATE_CHANGING_PREFIXES = ("set_", "navigation_", "call_", "send_", "open_close_")
+
+# ── Policy-compliance verifier rules (semantic-only wiki policies that can't ──
+# be reduced to a deterministic table — Check P). Trigger tools mirror the
+# organizer's own evaluator gating (enhance_policy_line_with_context in
+# reward_calculators.py) so this only fires on the subset of tasks that
+# actually touch these domains, not every turn. Policy text is the exact
+# wording from wiki.md.
+POLICY_VERIFIER_RULES: list[dict] = [
+    {
+        "id": "LLM-POL:007",
+        "trigger_tools": {"open_close_window"},
+        "policy_text": (
+            "If windows are requested by the user to open more than 25% (absolute position) "
+            "and AC is ON in that moment, prompt for confirmation and warn about energy inefficiency."
+        ),
+    },
+    {
+        "id": "LLM-POL:012",
+        "trigger_tools": {"set_climate_temperature"},
+        "policy_text": (
+            "If the user sets the temperature to a single seat zone and the resulting temperature "
+            "difference after execution to the other seat zones is more than 3 degrees Celsius, "
+            "then the user must be informed about it."
+        ),
+    },
+    {
+        "id": "LLM-POL:021",
+        "trigger_tools": {"get_routes_from_start_to_destination"},
+        "policy_text": (
+            "If a route is presented in detail (fastest route, shortest route, or upon user detail "
+            "request), and the route includes toll roads, then the user must be informed about it."
+        ),
+    },
+    {
+        "id": "LLM-POL:022",
+        "trigger_tools": {"get_routes_from_start_to_destination", "set_new_navigation"},
+        "policy_text": (
+            "If the user asks for a multi-stop route and does not specify the route selection, then "
+            "take the fastest route proactively per route segment. Inform the user that you took the "
+            "fastest alternative and ask if he wants more information on alternative routes. Still "
+            "inform the user if one route segment of the chosen routes includes a toll road."
+        ),
+    },
+]
+
+# Matches "2 PM", "1:30pm", "11:00 A.M." etc. for deterministic 24h conversion.
+_TIME_12H_PATTERN = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([AaPp])\.?[Mm]\.?\b")
+
 
 class CARBenchAgentExecutor(AgentExecutor):
     """Executor for the CAR-bench agent under test using native tool calling."""
@@ -306,6 +406,18 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.ctx_id_to_tool_history: dict[str, dict] = {}    # tool_name → raw result content
         self.ctx_id_to_pending_intent: dict[str, dict] = {}  # deferred call waiting on prereqs (list, batched)
         self.ctx_id_to_info_state: dict[str, dict] = {}      # "tool.field" → 0|1 binary vector
+        self.ctx_id_to_judged_tools: dict[str, set[str]] = {}  # tools already sent through the generic prereq judge (Check O), judged once per conversation
+        self.ctx_id_to_verifier_checked: dict[str, set[str]] = {}  # policy rule ids already checked by Check P, once per conversation
+
+        # Reflexion-style lessons-learned log — deliberately INSTANCE-level, not
+        # per-context_id, since it's meant to persist across different tasks
+        # within the same running benchmark process (this executor instance
+        # lives for the whole run). Populated whenever Check O/P catch a real
+        # violation; a short summary is injected into the system prompt for
+        # subsequent tasks so the agent doesn't repeat the same mistake
+        # category. Capped to keep prompt growth bounded.
+        self._reflection_log: list[str] = []
+        self._REFLECTION_LOG_MAX = 5
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         inbound_message = context.message
@@ -334,7 +446,17 @@ class CARBenchAgentExecutor(AgentExecutor):
                         system_prompt = parts_split[0].replace("System:", "").strip()
                         user_message_text = parts_split[1].strip()
                         if not messages:  # Only add system prompt once
-                            messages.append({"role": "system", "content": system_prompt})
+                            reflection_block = ""
+                            if self._reflection_log:
+                                lessons = "\n".join(f"- {note}" for note in self._reflection_log)
+                                reflection_block = (
+                                    "\n\nLESSONS FROM EARLIER TASKS THIS SESSION (avoid repeating these):\n"
+                                    + lessons
+                                )
+                            messages.append({
+                                "role": "system",
+                                "content": system_prompt + FORMAT_REMINDER + reflection_block,
+                            })
                     else:
                         # Regular user message
                         user_message_text = text
@@ -444,63 +566,77 @@ class CARBenchAgentExecutor(AgentExecutor):
         # not bypass policy checks like Check F side effects.
         completion_kwargs = self._build_completion_kwargs(messages, tools)
 
+        # Set when falling through from a preference-reconsideration pending
+        # intent, so the grounding check below knows to verify the LLM either
+        # acted or asked, instead of just claiming completion in text.
+        reconsidering_tool_name: str | None = None
+
         # ── Pending intent: if we auto-injected prereq(s) last turn, fire the original ──
         pending = self.ctx_id_to_pending_intent.get(context.context_id)
         if pending and incoming_tool_results:
             tool_history = self.ctx_id_to_tool_history.get(context.context_id, {})
             if all(pt in tool_history for pt in pending.get("prereq_tools", [])):
                 del self.ctx_id_to_pending_intent[context.context_id]
-                ctx_logger.info("Policy: firing pending intent", tool=pending["tool_name"])
-                pending_tc = {
-                    "id": str(uuid4()),
-                    "type": "function",
-                    "function": {
-                        "name": pending["tool_name"],
-                        "arguments": json.dumps(pending["args"]),
-                    },
-                }
-                # Route the refired call back through the policy layer — it may
-                # still need e.g. Check F side effects injected (AC/defrost/fog
-                # lights), not just a raw replay of the original proposed call.
-                policy_result = self._apply_policy_layer(
-                    ctx_id=context.context_id,
-                    tool_calls=[pending_tc],
-                    tools=tools,
-                    messages=messages,
-                    completion_kwargs=completion_kwargs,
-                    ctx_logger=ctx_logger,
-                )
-                final_tool_calls: list[dict] | None = [pending_tc]
-                final_text: str | None = None
-                if policy_result is not None:
-                    if policy_result["type"] == "replace_with_calls":
-                        final_tool_calls = policy_result["tool_calls"]
-                    elif policy_result["type"] == "replace_with_text":
-                        final_tool_calls = None
-                        final_text = policy_result["response"].choices[0].message.content
-                    elif policy_result["type"] == "replace_with_text_literal":
-                        final_tool_calls = None
-                        final_text = policy_result["text"]
-
-                pending_parts = []
-                if final_tool_calls is not None:
-                    pending_tool_calls_list = [
-                        ToolCall(tool_name=tc["function"]["name"], arguments=json.loads(tc["function"]["arguments"]))
-                        for tc in final_tool_calls
-                    ]
-                    pending_parts.append(new_data_part(ToolCallsData(tool_calls=pending_tool_calls_list).model_dump()))
-                    assistant_msg = {"role": "assistant", "content": None, "tool_calls": final_tool_calls}
+                if pending.get("needs_llm_reconsideration"):
+                    # Preference text just arrived in `messages` as a tool
+                    # result — don't replay the stale pre-preference args.
+                    # Fall through to the normal LLM call below so the model
+                    # can decide fresh with the preference text visible.
+                    ctx_logger.info("Policy: preferences resolved, letting LLM reconsider", tool=pending["tool_name"])
+                    reconsidering_tool_name = pending["tool_name"]
                 else:
-                    pending_parts.append(new_text_part(final_text or ""))
-                    assistant_msg = {"role": "assistant", "content": final_text}
-                messages.append(assistant_msg)
-                response_message = new_message(
-                    parts=pending_parts,
-                    context_id=context.context_id,
-                    role=Role.ROLE_AGENT,
-                )
-                await event_queue.enqueue_event(response_message)
-                return
+                    ctx_logger.info("Policy: firing pending intent", tool=pending["tool_name"])
+                    pending_tc = {
+                        "id": str(uuid4()),
+                        "type": "function",
+                        "function": {
+                            "name": pending["tool_name"],
+                            "arguments": json.dumps(pending["args"]),
+                        },
+                    }
+                    # Route the refired call back through the policy layer — it
+                    # may still need e.g. Check F side effects injected
+                    # (AC/defrost/fog lights), not just a raw replay.
+                    policy_result = self._apply_policy_layer(
+                        ctx_id=context.context_id,
+                        tool_calls=[pending_tc],
+                        tools=tools,
+                        messages=messages,
+                        completion_kwargs=completion_kwargs,
+                        ctx_logger=ctx_logger,
+                    )
+                    final_tool_calls: list[dict] | None = [pending_tc]
+                    final_text: str | None = None
+                    if policy_result is not None:
+                        if policy_result["type"] == "replace_with_calls":
+                            final_tool_calls = policy_result["tool_calls"]
+                        elif policy_result["type"] == "replace_with_text":
+                            final_tool_calls = None
+                            final_text = policy_result["response"].choices[0].message.content
+                        elif policy_result["type"] == "replace_with_text_literal":
+                            final_tool_calls = None
+                            final_text = policy_result["text"]
+                    final_text = self._enforce_24h_format(final_text)
+
+                    pending_parts = []
+                    if final_tool_calls is not None:
+                        pending_tool_calls_list = [
+                            ToolCall(tool_name=tc["function"]["name"], arguments=json.loads(tc["function"]["arguments"]))
+                            for tc in final_tool_calls
+                        ]
+                        pending_parts.append(new_data_part(ToolCallsData(tool_calls=pending_tool_calls_list).model_dump()))
+                        assistant_msg = {"role": "assistant", "content": None, "tool_calls": final_tool_calls}
+                    else:
+                        pending_parts.append(new_text_part(final_text or ""))
+                        assistant_msg = {"role": "assistant", "content": final_text}
+                    messages.append(assistant_msg)
+                    response_message = new_message(
+                        parts=pending_parts,
+                        context_id=context.context_id,
+                        role=Role.ROLE_AGENT,
+                    )
+                    await event_queue.enqueue_event(response_message)
+                    return
 
         # Call LLM with native tool calling
         try:
@@ -574,6 +710,122 @@ class CARBenchAgentExecutor(AgentExecutor):
                             "tool_calls": tool_calls,
                         }
 
+            # ── Zero-tool-call fallback detector ───────────────────────────
+            # Narrowly scoped to two precise triggers, to avoid misfiring on
+            # legitimate no-tool-call replies (e.g. a correct final answer to
+            # an informational question):
+            #   1. The very first assistant turn — a flat non-answer to the
+            #      user's opening request.
+            #   2. Right after a preference-reconsideration pending intent
+            #      falls through (see `reconsidering_tool_name` above) — the
+            #      LLM was specifically given a chance to act on fresh
+            #      preference info and instead just claimed completion in
+            #      text with no tool call and no question. This is the
+            #      documented "tool-use hallucination" pattern (base_7).
+            content_text = (assistant_content.get("content") or "").strip()
+            is_first_turn_nonanswer = len(messages) == 2  # [system, first user message]
+            if (
+                not tool_calls
+                and content_text
+                and not content_text.endswith("?")
+                and (is_first_turn_nonanswer or reconsidering_tool_name)
+            ):
+                ctx_logger.info(
+                    "Policy[fallback]: non-answer with no tool call, redirecting",
+                    reason="reconsideration" if reconsidering_tool_name else "first_turn",
+                    tool=reconsidering_tool_name,
+                )
+                if reconsidering_tool_name:
+                    hint = (
+                        f"You were reconsidering whether to call '{reconsidering_tool_name}' now "
+                        "that preference information is available. Your last reply neither called "
+                        "that tool (or an appropriate alternative) nor asked a specific question — "
+                        "it just claimed the action was done without actually doing it. Either call "
+                        "the tool now, or ask one specific question."
+                    )
+                else:
+                    hint = (
+                        "Your last reply neither called a tool nor asked the driver a specific "
+                        "question — it was just a non-committal statement. Either call the "
+                        "appropriate tool now to fulfill the request, or ask one specific "
+                        "clarifying question if something is genuinely missing."
+                    )
+                # Direct re-call (not _generate_clarification) — tools must stay
+                # enabled here since the whole point is letting the LLM call one.
+                redo_messages = messages + [{"role": "user", "content": f"[AGENT CONTEXT: {hint}]"}]
+                redo_resp = completion(messages=redo_messages, **completion_kwargs)
+                redo_msg = redo_resp.choices[0].message
+                assistant_content = redo_msg.model_dump(exclude_unset=True)
+                tool_calls = assistant_content.get("tool_calls")
+                if tool_calls:
+                    # The redo may itself need policy checks (prereqs, etc.)
+                    policy_result = self._apply_policy_layer(
+                        ctx_id=context.context_id,
+                        tool_calls=tool_calls,
+                        tools=tools,
+                        messages=messages,
+                        completion_kwargs=completion_kwargs,
+                        ctx_logger=ctx_logger,
+                    )
+                    if policy_result is not None:
+                        if policy_result["type"] in ("replace_with_text", "replace_with_text_literal"):
+                            tool_calls = None
+                            assistant_content = (
+                                {"role": "assistant", "content": policy_result["text"]}
+                                if policy_result["type"] == "replace_with_text_literal"
+                                else policy_result["response"].choices[0].message.model_dump(exclude_unset=True)
+                            )
+                        elif policy_result["type"] == "replace_with_calls":
+                            tool_calls = policy_result["tool_calls"]
+                            assistant_content = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+
+            # ── Check P: policy-compliance verifier ────────────────────────
+            # Runs on every final text response (no tool calls) — generalized
+            # (not gated by turn number or which tool was used) to catch any
+            # response that falsely claims a completed action, plus the
+            # semantic wiki policies (LLM-POL:007/012/021/022). If the redo
+            # produces a real tool call, it's routed through the full policy
+            # layer, same as any freshly proposed call. Redoes at most once
+            # per turn by construction (a single if-block, not a loop), so it
+            # cannot compound with the zero-tool-call fallback above into
+            # repeated redo cycles.
+            if not tool_calls and (assistant_content.get("content") or "").strip():
+                verifier_hint = self._run_policy_verifier(
+                    ctx_id=context.context_id,
+                    content_text=assistant_content["content"],
+                    completion_kwargs=completion_kwargs,
+                    ctx_logger=ctx_logger,
+                )
+                if verifier_hint:
+                    # Keep tools enabled — if a real action needs to happen, the
+                    # redo should be able to call it, not just rephrase the text.
+                    redo_messages = messages + [{"role": "user", "content": f"[AGENT CONTEXT: {verifier_hint}]"}]
+                    redo_resp = completion(messages=redo_messages, **completion_kwargs)
+                    assistant_content = redo_resp.choices[0].message.model_dump(exclude_unset=True)
+                    tool_calls = assistant_content.get("tool_calls")
+                    if tool_calls:
+                        # Route through the full policy layer, same as any newly
+                        # proposed tool call — it may need Checks A-O applied.
+                        policy_result = self._apply_policy_layer(
+                            ctx_id=context.context_id,
+                            tool_calls=tool_calls,
+                            tools=tools,
+                            messages=messages,
+                            completion_kwargs=completion_kwargs,
+                            ctx_logger=ctx_logger,
+                        )
+                        if policy_result is not None:
+                            if policy_result["type"] in ("replace_with_text", "replace_with_text_literal"):
+                                tool_calls = None
+                                assistant_content = (
+                                    {"role": "assistant", "content": policy_result["text"]}
+                                    if policy_result["type"] == "replace_with_text_literal"
+                                    else policy_result["response"].choices[0].message.model_dump(exclude_unset=True)
+                                )
+                            elif policy_result["type"] == "replace_with_calls":
+                                tool_calls = policy_result["tool_calls"]
+                                assistant_content = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+
             ctx_logger.info(
                 "LLM response received",
                 has_tool_calls=bool(tool_calls),
@@ -589,6 +841,11 @@ class CARBenchAgentExecutor(AgentExecutor):
                 tool_calls=[{"name": tc["function"]["name"], "args": tc["function"]["arguments"]} for tc in tool_calls] if tool_calls else None,
                 reasoning_content=assistant_content.get("reasoning_content")
             )
+
+            # Deterministic safety net for LLM-POL:002 — rewrite any 12h AM/PM
+            # mentions to 24h before the response is sent or stored in history.
+            if assistant_content.get("content"):
+                assistant_content["content"] = self._enforce_24h_format(assistant_content["content"])
 
             # Build proper A2A Message with Parts (protobuf)
             parts = []
@@ -702,6 +959,10 @@ class CARBenchAgentExecutor(AgentExecutor):
             del self.ctx_id_to_pending_intent[context.context_id]
         if context.context_id in self.ctx_id_to_info_state:
             del self.ctx_id_to_info_state[context.context_id]
+        if context.context_id in self.ctx_id_to_judged_tools:
+            del self.ctx_id_to_judged_tools[context.context_id]
+        if context.context_id in self.ctx_id_to_verifier_checked:
+            del self.ctx_id_to_verifier_checked[context.context_id]
 
     # ── Policy layer helper methods ───────────────────────────────────────────
 
@@ -837,6 +1098,47 @@ class CARBenchAgentExecutor(AgentExecutor):
 
         return completion_kwargs
 
+    def _enforce_24h_format(self, text: str | None) -> str | None:
+        """Deterministically rewrite 12h AM/PM time mentions to 24h format (LLM-POL:002).
+        Safety net alongside the prompt reminder — zero extra LLM calls."""
+        if not text:
+            return text
+
+        def _convert(match: "re.Match") -> str:
+            hour = int(match.group(1))
+            minute = match.group(2) or "00"
+            meridiem = match.group(3).lower()
+            if meridiem.startswith("p") and hour != 12:
+                hour += 12
+            elif meridiem.startswith("a") and hour == 12:
+                hour = 0
+            return f"{hour:02d}:{minute}"
+
+        return _TIME_12H_PATTERN.sub(_convert, text)
+
+    def _strip_json_fences(self, text: str) -> str:
+        """Strip markdown code fences (```json ... ``` or ``` ... ```) that
+        providers sometimes wrap structured JSON output in, even when
+        explicitly told to reply with only JSON. Safe no-op if none present.
+        Applied before every json.loads() on a raw completion response in
+        this file — a bare .strip() alone leaves fenced output unparseable."""
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[: -3]
+        return text.strip()
+
+    def _add_reflection(self, note: str) -> None:
+        """Reflexion-style: record a short, generalized lesson from a caught
+        violation (Check O/P), for injection into subsequent tasks' system
+        prompt this run. Deduplicated and capped — see _REFLECTION_LOG_MAX."""
+        if note in self._reflection_log:
+            return
+        self._reflection_log.append(note)
+        if len(self._reflection_log) > self._REFLECTION_LOG_MAX:
+            self._reflection_log.pop(0)
+
     def _describe_action(self, tc_name: str, tc_args: dict) -> str:
         """Template-based (no LLM call) human-readable description of a pending action."""
         if tc_name == "set_head_lights_high_beams":
@@ -847,28 +1149,138 @@ class CARBenchAgentExecutor(AgentExecutor):
         details = ", ".join(f"{k}={v}" for k, v in tc_args.items())
         return f"{readable} ({details})"
 
-    def _score_question_eig(self, question: str, interpretations: list[str], completion_kwargs: dict) -> int:
-        """Score a question by how evenly it splits interpretations (lower = better split)."""
+    def _judge_generic_prereq(self, messages: list[dict], tc_name: str, tc_args: dict, ctx_logger) -> str | None:
+        """AgentGuard-style fallback for tools outside PREREQUISITE_TABLE: ask a
+        lightweight, policy-grounded judge whether this call skips a
+        prerequisite the wiki requires. Judged once per tool per conversation
+        (see ctx_id_to_judged_tools) to bound cost — this only fires for the
+        long tail of tools our hardcoded tables don't cover.
+        Returns a hint string if a likely-missing prerequisite is found, else None."""
+        wiki_text = next((m["content"] for m in messages if m.get("role") == "system"), "")
         prompt = (
-            f"For each interpretation, would the answer to this question be YES or NO?\n"
-            f"Question: {question}\n"
-            f"Interpretations:\n"
-            + "\n".join(f"{i+1}. {interp}" for i, interp in enumerate(interpretations))
-            + "\nReply with only a JSON array of YES or NO strings, one per interpretation in order."
+            f"Policy excerpt:\n{wiki_text[:4000]}\n\n"
+            f"The assistant is about to call '{tc_name}' with arguments {json.dumps(tc_args)}.\n"
+            "Based ONLY on the policy above, does this call skip a prerequisite the policy "
+            "requires (e.g. checking current state, weather, or confirmation first)? "
+            "If the policy doesn't mention this tool or has no applicable prerequisite, answer false.\n"
+            'Reply with only a JSON object: {"missing_prereq": true/false, "hint": "<short reason or empty>"}'
         )
-        kwargs = {k: v for k, v in completion_kwargs.items() if k != "tools"}
-        kwargs["temperature"] = 0.0
         try:
+            resp = completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.0,
+                num_retries=LLM_NUM_RETRIES,
+                timeout=LLM_TIMEOUT_SECONDS,
+                response_format=GenericPrereqJudgment,
+            )
+            parsed = json.loads(self._strip_json_fences(resp.choices[0].message.content))
+            if parsed.get("missing_prereq"):
+                ctx_logger.info("Policy[O]: generic judge flagged missing prereq", tool=tc_name, hint=parsed.get("hint"))
+                self._add_reflection(
+                    f"Before calling '{tc_name}' (or similar tools not in the standard prereq "
+                    "table), check whether the policy requires confirming current state first."
+                )
+                return parsed.get("hint") or f"There may be a missing prerequisite before calling {tc_name}."
+        except Exception as e:
+            ctx_logger.warning("Policy[O]: judge call failed, skipping", tool=tc_name, error=str(e))
+        return None
+
+    def _run_policy_verifier(
+        self, ctx_id: str, content_text: str, completion_kwargs: dict, ctx_logger
+    ) -> str | None:
+        """Check P — policy-compliance verifier. Runs on every final text-only
+        response (not gated by which tool was used) and checks two things in
+        one call:
+        (1) a general rule that applies to ANY response — does it falsely
+        claim a state-changing action was completed with no tool call in this
+        same response to back it up (the documented "tool-use hallucination"
+        pattern — e.g. saying "I'm calling her now" with no matching tool
+        call). Purely reporting already-retrieved information is NOT a
+        violation of this rule.
+        (2) the semantic-only wiki policies that can't be reduced to a
+        deterministic table (LLM-POL:007/012/021/022), each checked at most
+        once per conversation (scoped like the organizer's own evaluator —
+        only checked if its trigger tool was actually used) to bound cost.
+        Fails open on any error — never blocks a response over a judge
+        failure. Returns a hint to redo the response if a violation is found,
+        else None."""
+        if not content_text:
+            return None
+        tool_history = self.ctx_id_to_tool_history.get(ctx_id, {})
+        checked = self.ctx_id_to_verifier_checked.setdefault(ctx_id, set())
+        applicable = [
+            rule for rule in POLICY_VERIFIER_RULES
+            if rule["id"] not in checked and rule["trigger_tools"] & tool_history.keys()
+        ]
+        for rule in applicable:
+            checked.add(rule["id"])  # checked at most once per conversation, regardless of outcome
+
+        general_rule = (
+            "- [COMPLETION_CLAIM] The response must not claim, imply, or describe a "
+            "state-changing action (turning something on/off, setting a value, calling "
+            "someone, sending something, etc.) as already done unless a matching tool "
+            "call actually accompanies this exact response. Purely reporting information "
+            "already retrieved earlier (e.g. summarizing a prior GET result) is NOT a "
+            "violation of this rule."
+        )
+        table_rules = "\n".join(f"- [{r['id']}] {r['policy_text']}" for r in applicable)
+        policy_lines = general_rule + ("\n" + table_rules if table_rules else "")
+
+        # Ground the judgment in actual evidence (which tools genuinely executed
+        # this conversation) rather than judging the text in isolation — a
+        # claim can only be "backed up" by a real tool call that actually
+        # happened, not by how confidently the response is phrased.
+        executed_tools = sorted(tool_history.keys()) if tool_history else []
+        evidence_line = f"Tools actually executed so far in this conversation: {executed_tools}\n"
+
+        prompt = (
+            f"Policy lines to check:\n{policy_lines}\n\n"
+            f"{evidence_line}\n"
+            f'The car assistant is about to send this response to the driver, with NO tool '
+            f'calls attached to this exact response:\n"{content_text}"\n\n'
+            "For each policy line, was it followed by this response? Ground your answer in the "
+            "executed-tools evidence above, not just the wording of the response. If a policy "
+            "doesn't apply given what's known, or there isn't enough information to tell, answer "
+            "true (followed).\n"
+            'Reply with only a JSON object: {"results": [{"id": "...", "followed": true/false, "reason": "..."}]}'
+        )
+        try:
+            kwargs = {k: v for k, v in completion_kwargs.items() if k != "tools"}
+            kwargs["temperature"] = 0.0
+            kwargs["response_format"] = PolicyVerifierResult
             resp = completion(messages=[{"role": "user", "content": prompt}], **kwargs)
-            answers = json.loads(resp.choices[0].message.content.strip())
-            yes_count = sum(1 for a in answers if str(a).upper().startswith("Y"))
-            no_count = len(answers) - yes_count
-            return abs(yes_count - no_count)
-        except Exception:
-            return len(interpretations)
+            parsed = json.loads(self._strip_json_fences(resp.choices[0].message.content))
+            results = parsed.get("results", [])
+            violations = [r for r in results if not r.get("followed", True)]
+            if violations:
+                reasons = "; ".join(f"{v.get('id')}: {v.get('reason', '')}" for v in violations)
+                ctx_logger.info("Policy[P]: compliance issue flagged", violations=reasons)
+                for v in violations:
+                    if v.get("id") == "COMPLETION_CLAIM":
+                        self._add_reflection(
+                            "Never describe a state-changing action as done unless the matching "
+                            "tool call is actually included in that same response."
+                        )
+                    else:
+                        self._add_reflection(f"Watch for {v.get('id')}: {v.get('reason', '')[:100]}")
+                return (
+                    f"Before finalizing, address this: {reasons}. If an action actually needs "
+                    "to happen, call the appropriate tool now instead of just describing it. "
+                    "Otherwise, revise your reply to the driver, keeping it natural and brief."
+                )
+        except Exception as e:
+            ctx_logger.warning("Policy[P]: verifier call failed, skipping", error=str(e))
+        return None
 
     def _generate_evpi_clarification(self, user_request: str, messages: list[dict], completion_kwargs: dict):
-        """Generate the most informative clarifying question when tool-level ambiguity is detected."""
+        """Generate the most informative clarifying question when tool-level ambiguity
+        is detected. Collapsed to 2 LLM calls (was up to 6): one call produces
+        interpretations, candidate questions, AND each candidate's predicted
+        yes/no answer per interpretation in a single structured response; the
+        actual expected-information-gain scoring (how balanced each candidate's
+        yes/no split is) is then computed deterministically in Python — no LLM
+        call per candidate. A final call phrases the winner naturally."""
         cache_key = "evpi:" + hashlib.md5(user_request.strip().lower().encode()).hexdigest()
         if cache_key in _EVPI_CACHE:
             cached_question = _EVPI_CACHE[cache_key]
@@ -882,50 +1294,49 @@ class CARBenchAgentExecutor(AgentExecutor):
 
         kwargs = {k: v for k, v in completion_kwargs.items() if k != "tools"}
 
-        # Step 1: generate diverse interpretations referencing different car systems
+        # Step 1: one call producing interpretations + candidate questions +
+        # each candidate's predicted yes/no answer per interpretation.
         kwargs["temperature"] = 0.7
-        interp_prompt = (
+        combined_prompt = (
             f'The car driver said: "{user_request}"\n'
-            "List 3-4 distinct possible interpretations of what they might want. "
+            "1. List 3-4 distinct possible interpretations of what they might want. "
             "Each must reference a specific car system (AC, seat heating, windows, navigation, etc.).\n"
-            "Reply with only a JSON array of strings."
+            "2. Generate 3 short yes/no clarifying questions that could help distinguish between those "
+            "interpretations. Questions must be natural, brief, and safe for a driver to answer.\n"
+            "3. For each of the 3 questions, predict whether the answer would be YES or NO under each "
+            "interpretation, in the same order as the interpretations list.\n"
+            "Reply with only a JSON object of this exact shape:\n"
+            '{"interpretations": ["...", "..."], '
+            '"candidates": [{"question": "...", "answers": ["YES", "NO", ...]}, ...]}'
         )
         try:
-            interp_resp = completion(messages=[{"role": "user", "content": interp_prompt}], **kwargs)
-            interpretations = json.loads(interp_resp.choices[0].message.content.strip())
-            if not isinstance(interpretations, list) or len(interpretations) < 2:
+            resp = completion(
+                messages=[{"role": "user", "content": combined_prompt}],
+                response_format=EVPIResponse,
+                **kwargs,
+            )
+            data = json.loads(self._strip_json_fences(resp.choices[0].message.content))
+            interpretations = data["interpretations"]
+            candidates = data["candidates"]
+            if not isinstance(interpretations, list) or len(interpretations) < 2 or not candidates:
                 return None
         except Exception:
             return None
 
-        # Step 2: generate candidate yes/no clarifying questions
-        kwargs["temperature"] = 0.7
-        q_prompt = (
-            f'The car driver said: "{user_request}"\n'
-            f"Possible interpretations: {json.dumps(interpretations)}\n"
-            "Generate 3 short yes/no clarifying questions to identify which interpretation is correct. "
-            "Questions must be natural, brief, and safe for a driver to answer.\n"
-            "Reply with only a JSON array of 3 question strings."
-        )
-        try:
-            q_resp = completion(messages=[{"role": "user", "content": q_prompt}], **kwargs)
-            candidates = json.loads(q_resp.choices[0].message.content.strip())
-            if not isinstance(candidates, list) or len(candidates) == 0:
-                return None
-        except Exception:
+        # Step 2: pick the candidate with the most balanced YES/NO split (best
+        # expected information gain) — computed deterministically, no LLM call.
+        def _split_score(candidate: dict) -> int:
+            answers = candidate.get("answers", [])
+            yes_count = sum(1 for a in answers if str(a).upper().startswith("Y"))
+            no_count = len(answers) - yes_count
+            return abs(yes_count - no_count)
+
+        best_candidate = min(candidates, key=_split_score)
+        best_question = best_candidate.get("question", "")
+        if not best_question:
             return None
 
-        # Step 3: pick question with best info gain (most balanced YES/NO split).
-        # Candidates are scored concurrently — each is an independent LLM call,
-        # so running them in a thread pool cuts wall-clock time from N sequential
-        # calls to ~1 call's latency instead of adding LLM call count.
-        kwargs["temperature"] = 0.0
-        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
-            scores = list(pool.map(lambda q: self._score_question_eig(q, interpretations, kwargs), candidates))
-        scored = list(zip(scores, candidates))
-        best_question = min(scored, key=lambda x: x[0])[1]
-
-        # Step 4: phrase it naturally in the agent's voice
+        # Step 3: phrase it naturally in the agent's voice
         kwargs["temperature"] = 0.0
         phrase_messages = messages + [{
             "role": "user",
@@ -1104,14 +1515,30 @@ class CARBenchAgentExecutor(AgentExecutor):
 
             # ── Check E: Preference auto-injection ────────────────────────────────
             # If agent is about to call a preference-sensitive tool but hasn't
-            # fetched user preferences yet, inject get_user_preferences first.
-            if tc_name in PREFERENCE_PREREQUISITE_TABLE and "get_user_preferences" not in tool_history:
+            # fetched user preferences yet, inject get_user_preferences first —
+            # but ONLY when the proposed call is actually incomplete. Explicit
+            # user request outranks learned preferences (wiki Priority 1 > 2):
+            # if the LLM already has a fully-specified call (e.g. the user just
+            # said "level 3"), there's nothing left for a preference to resolve
+            # — checking anyway wastes a full LLM round-trip for no behavioral
+            # difference in the outcome.
+            call_is_incomplete = bool(self._get_missing_required_params(tc_name, tc_args, tools))
+            if (
+                tc_name in PREFERENCE_PREREQUISITE_TABLE
+                and call_is_incomplete
+                and "get_user_preferences" not in tool_history
+            ):
                 pref_categories = PREFERENCE_PREREQUISITE_TABLE[tc_name]
                 ctx_logger.info("Policy[E]: auto-injecting get_user_preferences", for_tool=tc_name)
                 self.ctx_id_to_pending_intent[ctx_id] = {
                     "tool_name": tc_name,
                     "args": tc_args,
                     "prereq_tools": ["get_user_preferences"],
+                    # Preferences are free-text (List[str], not structured
+                    # key/value data) — only an LLM can interpret them, so the
+                    # original stale args must not be blindly replayed. Let the
+                    # LLM re-decide once it can see the preference text.
+                    "needs_llm_reconsideration": True,
                 }
                 pref_tc = {
                     "id": str(uuid4()),
@@ -1122,6 +1549,22 @@ class CARBenchAgentExecutor(AgentExecutor):
                     },
                 }
                 return {"type": "replace_with_calls", "tool_calls": [pref_tc]}
+
+            # ── Check O: generic prereq fallback for tools outside PREREQUISITE_TABLE ──
+            # AgentGuard-style safety net: PREREQUISITE_TABLE only covers a fixed
+            # ~13-tool list. For any other state-changing call, ask a lightweight
+            # policy-grounded judge once per tool per conversation whether it
+            # skips a wiki-required prerequisite, instead of leaving the long
+            # tail of uncovered tools with zero prereq checking.
+            if (
+                tc_name.startswith(STATE_CHANGING_PREFIXES)
+                and tc_name not in PREREQUISITE_TABLE
+                and tc_name not in self.ctx_id_to_judged_tools.get(ctx_id, set())
+            ):
+                self.ctx_id_to_judged_tools.setdefault(ctx_id, set()).add(tc_name)
+                verdict_hint = self._judge_generic_prereq(messages, tc_name, tc_args, ctx_logger)
+                if verdict_hint:
+                    return {"type": "replace_with_text", "response": self._generate_clarification(messages, verdict_hint, completion_kwargs)}
 
         # ── Check H: nav-edit tools must not run in parallel (TECH-AUT-POL:018) ──
         nav_edit_calls = [tc for tc in tool_calls if tc["function"]["name"] in NAVIGATION_EDIT_TOOLS]

@@ -796,8 +796,8 @@ def build_args_from_config(config: dict, task_type: str) -> argparse.Namespace:
         planning_and_thinking_tool=True,
         remove_non_standard_fields_from_tools=False,
         few_shot_displays_path=None,
-        seed=10,
-        shuffle=False,
+        seed=config.get("seed", 10),
+        shuffle=config.get("shuffle", False),
     )
 
 

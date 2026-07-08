@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import diskcache
@@ -41,6 +42,14 @@ sys.path.pop(0)
 logger = configure_logger(role="agent_under_test", context="-")
 
 SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
+
+# ── Retry/timeout bounds for every LLM call in this agent ─────────────────────
+# Without this, a single transient provider error (e.g. Gemini 503 "high
+# demand") can hang a task for a very long time under litellm's own default
+# retry/backoff. Configurable via env vars so dev vs. hidden-set runs can tune
+# without a code change.
+LLM_NUM_RETRIES = int(os.getenv("AGENT_LLM_NUM_RETRIES", "3"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("AGENT_LLM_TIMEOUT_SECONDS", "30"))
 
 # ── Prerequisite table: what must happen before calling each tool ─────────────
 # Derived directly from wiki.md policies (AUT-POL / LLM-POL).
@@ -249,6 +258,36 @@ REQUIRED_FIELDS_FOR_ACTION: dict[str, set[str]] = {
     },
 }
 
+# ── Window enum → get_vehicle_window_positions field (for AC side-effect check) ─
+WINDOW_POSITION_FIELDS: dict[str, str] = {
+    "DRIVER": "window_driver_position",
+    "PASSENGER": "window_passenger_position",
+    "DRIVER_REAR": "window_driver_rear_position",
+    "PASSENGER_REAR": "window_passenger_rear_position",
+}
+
+# ── Nav-editing tools that must never be called in parallel (TECH-AUT-POL:018) ─
+NAVIGATION_EDIT_TOOLS: set[str] = {
+    "navigation_add_one_waypoint",
+    "navigation_delete_final_destination",
+    "navigation_delete_one_waypoint",
+    "navigation_replace_final_destination",
+    "navigation_replace_one_waypoint",
+}
+
+# ── Tools requiring explicit user confirmation before calling (LLM-POL:004) ────
+CONFIRMATION_REQUIRED_TOOLS: set[str] = {
+    "send_email",
+    "open_close_trunk_door",
+    "set_head_lights_high_beams",
+}
+
+# Short affirmative replies that count as explicit confirmation for the above.
+_AFFIRMATIVE_PATTERNS: set[str] = {
+    "yes", "yeah", "yep", "yup", "sure", "confirmed", "confirm",
+    "go ahead", "please do", "do it", "correct", "affirmative", "ok", "okay",
+}
+
 
 class CARBenchAgentExecutor(AgentExecutor):
     """Executor for the CAR-bench agent under test using native tool calling."""
@@ -265,7 +304,7 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.ctx_id_to_turn_metrics: dict[str, dict] = {}
         # Policy layer state (Points 1-5)
         self.ctx_id_to_tool_history: dict[str, dict] = {}    # tool_name → raw result content
-        self.ctx_id_to_pending_intent: dict[str, dict] = {}  # deferred call waiting on prereq
+        self.ctx_id_to_pending_intent: dict[str, dict] = {}  # deferred call waiting on prereqs (list, batched)
         self.ctx_id_to_info_state: dict[str, dict] = {}      # "tool.field" → 0|1 binary vector
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
@@ -400,11 +439,16 @@ class CARBenchAgentExecutor(AgentExecutor):
             # Regular user message
             messages.append({"role": "user", "content": user_message_text})
 
-        # ── Pending intent: if we auto-injected a prereq last turn, fire the original ──
+        # Built early — needed both for the main LLM call below and to re-run
+        # the policy layer on a refired pending intent (see below), which must
+        # not bypass policy checks like Check F side effects.
+        completion_kwargs = self._build_completion_kwargs(messages, tools)
+
+        # ── Pending intent: if we auto-injected prereq(s) last turn, fire the original ──
         pending = self.ctx_id_to_pending_intent.get(context.context_id)
         if pending and incoming_tool_results:
             tool_history = self.ctx_id_to_tool_history.get(context.context_id, {})
-            if pending.get("prereq_tool") in tool_history:
+            if all(pt in tool_history for pt in pending.get("prereq_tools", [])):
                 del self.ctx_id_to_pending_intent[context.context_id]
                 ctx_logger.info("Policy: firing pending intent", tool=pending["tool_name"])
                 pending_tc = {
@@ -415,11 +459,40 @@ class CARBenchAgentExecutor(AgentExecutor):
                         "arguments": json.dumps(pending["args"]),
                     },
                 }
-                pending_tool_calls_list = [
-                    ToolCall(tool_name=pending["tool_name"], arguments=pending["args"])
-                ]
-                pending_parts = [new_data_part(ToolCallsData(tool_calls=pending_tool_calls_list).model_dump())]
-                assistant_msg = {"role": "assistant", "content": None, "tool_calls": [pending_tc]}
+                # Route the refired call back through the policy layer — it may
+                # still need e.g. Check F side effects injected (AC/defrost/fog
+                # lights), not just a raw replay of the original proposed call.
+                policy_result = self._apply_policy_layer(
+                    ctx_id=context.context_id,
+                    tool_calls=[pending_tc],
+                    tools=tools,
+                    messages=messages,
+                    completion_kwargs=completion_kwargs,
+                    ctx_logger=ctx_logger,
+                )
+                final_tool_calls: list[dict] | None = [pending_tc]
+                final_text: str | None = None
+                if policy_result is not None:
+                    if policy_result["type"] == "replace_with_calls":
+                        final_tool_calls = policy_result["tool_calls"]
+                    elif policy_result["type"] == "replace_with_text":
+                        final_tool_calls = None
+                        final_text = policy_result["response"].choices[0].message.content
+                    elif policy_result["type"] == "replace_with_text_literal":
+                        final_tool_calls = None
+                        final_text = policy_result["text"]
+
+                pending_parts = []
+                if final_tool_calls is not None:
+                    pending_tool_calls_list = [
+                        ToolCall(tool_name=tc["function"]["name"], arguments=json.loads(tc["function"]["arguments"]))
+                        for tc in final_tool_calls
+                    ]
+                    pending_parts.append(new_data_part(ToolCallsData(tool_calls=pending_tool_calls_list).model_dump()))
+                    assistant_msg = {"role": "assistant", "content": None, "tool_calls": final_tool_calls}
+                else:
+                    pending_parts.append(new_text_part(final_text or ""))
+                    assistant_msg = {"role": "assistant", "content": final_text}
                 messages.append(assistant_msg)
                 response_message = new_message(
                     parts=pending_parts,
@@ -431,59 +504,6 @@ class CARBenchAgentExecutor(AgentExecutor):
 
         # Call LLM with native tool calling
         try:
-            is_anthropic = "claude" in self.model.lower() or "anthropic" in self.model.lower()
-
-            # Prompt caching is Anthropic-only — skip for Ollama/Groq/Gemini etc.
-            if is_anthropic:
-                if tools:
-                    tools[-1]["function"]["cache_control"] = {"type": "ephemeral"}
-                if messages:
-                    messages[0]["cache_control"] = {"type": "ephemeral"}
-
-            completion_kwargs = {
-                "model": self.model,
-                "tools": tools if tools else None
-            }
-
-            # Ollama needs a larger context window to fit 57 tool schemas (~10K tokens)
-            if self.model.startswith("ollama/"):
-                completion_kwargs["num_ctx"] = 16384
-
-            if self.temperature is not None:
-                completion_kwargs["temperature"] = self.temperature
-
-            # Configure reasoning effort / thinking
-            if self.thinking:
-                    if self.model == "claude-opus-4-6":
-                        completion_kwargs["thinking"] = {
-                            "type": "adaptive"
-                        }
-                    else:
-                        if self.reasoning_effort in [
-                            "none",
-                            "disable",
-                            "low",
-                            "medium",
-                            "high",
-                        ]:
-                            completion_kwargs["reasoning_effort"] = self.reasoning_effort
-                        else:
-                            try:
-                                thinking_budget = int(self.reasoning_effort)
-                            except ValueError:
-                                raise ValueError(
-                                    "reasoning_effort must be 'none', 'disable', 'low', 'medium', 'high', or an integer value"
-                                )
-                            completion_kwargs["thinking"] = {
-                                "type": "enabled",
-                                "budget_tokens": thinking_budget,
-                            }
-                    if self.interleaved_thinking:
-                        completion_kwargs["extra_headers"] = {
-                                "anthropic-beta": "interleaved-thinking-2025-05-14"
-                            }
-
-
             call_start_time = time.perf_counter()
             response = completion(
                 messages=messages,
@@ -539,6 +559,12 @@ class CARBenchAgentExecutor(AgentExecutor):
                         pol_resp = policy_result["response"]
                         pol_msg = pol_resp.choices[0].message
                         assistant_content = pol_msg.model_dump(exclude_unset=True)
+                        tool_calls = None
+                    elif policy_result["type"] == "replace_with_text_literal":
+                        # No LLM re-call — deterministic template text, saves a
+                        # full round-trip for checks whose response doesn't need
+                        # natural phrasing to be correct.
+                        assistant_content = {"role": "assistant", "content": policy_result["text"]}
                         tool_calls = None
                     elif policy_result["type"] == "replace_with_calls":
                         tool_calls = policy_result["tool_calls"]
@@ -745,6 +771,82 @@ class CARBenchAgentExecutor(AgentExecutor):
         msg_lower = user_msg.lower()
         return not any(term in msg_lower for term in self._SPECIFIC_CAR_TERMS)
 
+    def _last_user_message_is_affirmative(self, messages: list[dict]) -> bool:
+        """True if the most recent user message reads as an explicit 'yes' confirmation."""
+        user_msgs = [m for m in messages if m.get("role") == "user" and m.get("content")]
+        if not user_msgs:
+            return False
+        last = user_msgs[-1]["content"].strip().lower()
+        if len(last.split()) > 6:
+            # Longer replies only count if they clearly open with confirmation.
+            return any(last.startswith(p) for p in _AFFIRMATIVE_PATTERNS)
+        return any(p in last for p in _AFFIRMATIVE_PATTERNS)
+
+    def _build_completion_kwargs(self, messages: list[dict], tools: list[dict]) -> dict:
+        """Build the litellm completion() kwargs. Shared by the main LLM call and
+        by the pending-intent refire path, which must reuse the same kwargs when
+        routing a refired call back through the policy layer."""
+        is_anthropic = "claude" in self.model.lower() or "anthropic" in self.model.lower()
+
+        # Prompt caching is Anthropic-only — skip for Ollama/Groq/Gemini etc.
+        if is_anthropic:
+            if tools:
+                tools[-1]["function"]["cache_control"] = {"type": "ephemeral"}
+            if messages:
+                messages[0]["cache_control"] = {"type": "ephemeral"}
+
+        completion_kwargs = {
+            "model": self.model,
+            "tools": tools if tools else None,
+            # Bounded retry/timeout — prevents a single transient provider
+            # error (e.g. Gemini 503 "high demand") from hanging a task for
+            # an unbounded amount of time via litellm's own default backoff.
+            "num_retries": LLM_NUM_RETRIES,
+            "timeout": LLM_TIMEOUT_SECONDS,
+        }
+
+        # Ollama needs a larger context window to fit 57 tool schemas (~10K tokens)
+        if self.model.startswith("ollama/"):
+            completion_kwargs["num_ctx"] = 16384
+
+        if self.temperature is not None:
+            completion_kwargs["temperature"] = self.temperature
+
+        # Configure reasoning effort / thinking
+        if self.thinking:
+            if self.model == "claude-opus-4-6":
+                completion_kwargs["thinking"] = {"type": "adaptive"}
+            else:
+                if self.reasoning_effort in ["none", "disable", "low", "medium", "high"]:
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                else:
+                    try:
+                        thinking_budget = int(self.reasoning_effort)
+                    except ValueError:
+                        raise ValueError(
+                            "reasoning_effort must be 'none', 'disable', 'low', 'medium', 'high', or an integer value"
+                        )
+                    completion_kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking_budget,
+                    }
+            if self.interleaved_thinking:
+                completion_kwargs["extra_headers"] = {
+                    "anthropic-beta": "interleaved-thinking-2025-05-14"
+                }
+
+        return completion_kwargs
+
+    def _describe_action(self, tc_name: str, tc_args: dict) -> str:
+        """Template-based (no LLM call) human-readable description of a pending action."""
+        if tc_name == "set_head_lights_high_beams":
+            return "turn the high beams " + ("on" if tc_args.get("on") else "off")
+        readable = tc_name.replace("_", " ")
+        if not tc_args:
+            return readable
+        details = ", ".join(f"{k}={v}" for k, v in tc_args.items())
+        return f"{readable} ({details})"
+
     def _score_question_eig(self, question: str, interpretations: list[str], completion_kwargs: dict) -> int:
         """Score a question by how evenly it splits interpretations (lower = better split)."""
         prompt = (
@@ -813,9 +915,14 @@ class CARBenchAgentExecutor(AgentExecutor):
         except Exception:
             return None
 
-        # Step 3: pick question with best info gain (most balanced YES/NO split)
+        # Step 3: pick question with best info gain (most balanced YES/NO split).
+        # Candidates are scored concurrently — each is an independent LLM call,
+        # so running them in a thread pool cuts wall-clock time from N sequential
+        # calls to ~1 call's latency instead of adding LLM call count.
         kwargs["temperature"] = 0.0
-        scored = [(self._score_question_eig(q, interpretations, kwargs), q) for q in candidates]
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            scores = list(pool.map(lambda q: self._score_question_eig(q, interpretations, kwargs), candidates))
+        scored = list(zip(scores, candidates))
         best_question = min(scored, key=lambda x: x[0])[1]
 
         # Step 4: phrase it naturally in the agent's voice
@@ -826,6 +933,77 @@ class CARBenchAgentExecutor(AgentExecutor):
         }]
         _EVPI_CACHE.set(cache_key, best_question, expire=86400)  # 24h TTL
         return completion(messages=phrase_messages, **kwargs)
+
+    # ── Post-action side-effect policies (AUT-POL:010/011/013) ────────────────
+    # These fire *after* a trigger call is accepted, using state already fetched
+    # via PREREQUISITE_TABLE (get_vehicle_window_positions / get_climate_settings /
+    # get_exterior_lights_status are mandatory prereqs for these same trigger
+    # tools, so their results are already cached in tool_history by this point).
+
+    def _get_tool_result(self, ctx_id: str, tool_name: str) -> dict:
+        """Parse a cached tool_history[tool_name] JSON string into its result dict."""
+        raw = self.ctx_id_to_tool_history.get(ctx_id, {}).get(tool_name)
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            return parsed.get("result", parsed) if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, AttributeError):
+            return {}
+
+    def _side_effects_air_conditioning(self, ctx_id: str, tc_args: dict) -> list[tuple[str, dict]]:
+        """AUT-POL:011 — AC on must close windows >20% open and raise fan speed off 0."""
+        if not tc_args.get("on"):
+            return []
+        effects: list[tuple[str, dict]] = []
+        windows = self._get_tool_result(ctx_id, "get_vehicle_window_positions")
+        open_windows = [
+            enum for enum, field in WINDOW_POSITION_FIELDS.items()
+            if (windows.get(field) or 0) > 20
+        ]
+        if open_windows and len(open_windows) == len(WINDOW_POSITION_FIELDS):
+            effects.append(("open_close_window", {"window": "ALL", "percentage": 0}))
+        else:
+            effects.extend(("open_close_window", {"window": w, "percentage": 0}) for w in open_windows)
+        climate = self._get_tool_result(ctx_id, "get_climate_settings")
+        if (climate.get("fan_speed") or 0) == 0:
+            effects.append(("set_fan_speed", {"level": 1}))
+        return effects
+
+    def _side_effects_window_defrost(self, ctx_id: str, tc_args: dict) -> list[tuple[str, dict]]:
+        """AUT-POL:010 — defrost on must raise fan speed, include WINDSHIELD airflow, and turn on AC."""
+        if not tc_args.get("on"):
+            return []
+        effects: list[tuple[str, dict]] = []
+        climate = self._get_tool_result(ctx_id, "get_climate_settings")
+        if (climate.get("fan_speed") or 0) < 2:
+            effects.append(("set_fan_speed", {"level": 2}))
+        if "WINDSHIELD" not in (climate.get("fan_airflow_direction") or ""):
+            effects.append(("set_fan_airflow_direction", {"direction": "WINDSHIELD"}))
+        if not climate.get("air_conditioning", False):
+            effects.append(("set_air_conditioning", {"on": True}))
+        return effects
+
+    def _side_effects_fog_lights(self, ctx_id: str, tc_args: dict) -> list[tuple[str, dict]]:
+        """AUT-POL:013 — fog lights on must ensure low beams on and high beams off."""
+        if not tc_args.get("on"):
+            return []
+        effects: list[tuple[str, dict]] = []
+        lights = self._get_tool_result(ctx_id, "get_exterior_lights_status")
+        if lights.get("head_lights_low_beams") is False:
+            effects.append(("set_head_lights_low_beams", {"on": True}))
+        if lights.get("head_lights_high_beams") is True:
+            effects.append(("set_head_lights_high_beams", {"on": False}))
+        return effects
+
+    def _compute_side_effects(self, ctx_id: str, tc_name: str, tc_args: dict) -> list[tuple[str, dict]]:
+        if tc_name == "set_air_conditioning":
+            return self._side_effects_air_conditioning(ctx_id, tc_args)
+        if tc_name == "set_window_defrost":
+            return self._side_effects_window_defrost(ctx_id, tc_args)
+        if tc_name == "set_fog_lights":
+            return self._side_effects_fog_lights(ctx_id, tc_args)
+        return []
 
     def _apply_policy_layer(
         self,
@@ -857,48 +1035,72 @@ class CARBenchAgentExecutor(AgentExecutor):
             # ── Check A: Tool existence (E5b fix) ────────────────────────
             if tc_name not in available_tool_names:
                 ctx_logger.info("Policy[A]: tool not available", tool=tc_name)
-                hint = (
-                    f"The driver asked for something that requires '{tc_name}', "
-                    "but this capability isn't available in their car. "
-                    "Let them know honestly and briefly — warm but direct, no over-apologizing."
-                )
-                return {"type": "replace_with_text", "response": self._generate_clarification(messages, hint, completion_kwargs)}
+                text = "Sorry, I'm not able to do that with this car — that feature isn't available here."
+                return {"type": "replace_with_text_literal", "text": text}
+
+            # ── Check I: explicit confirmation required (LLM-POL:004) ─────
+            if tc_name in CONFIRMATION_REQUIRED_TOOLS:
+                if not self._last_user_message_is_affirmative(messages):
+                    ctx_logger.info("Policy[I]: confirmation required, not yet given", tool=tc_name)
+                    text = f"Just to confirm — I'm about to {self._describe_action(tc_name, tc_args)}. Should I go ahead?"
+                    return {"type": "replace_with_text_literal", "text": text}
 
             # ── Check B: Prerequisites (E1 fix) ──────────────────────────
+            # Collect ALL missing auto-injectable prereqs at once instead of one
+            # per turn — cuts N sequential evaluator round-trips to 1 for tools
+            # like set_air_conditioning that need multiple independent GET calls.
+            missing_auto: list[dict] = []
+            missing_manual: dict | None = None
             for prereq in PREREQUISITE_TABLE.get(tc_name, []):
                 prereq_tool = prereq["requires_tool"]
                 if prereq_tool not in tool_history:
                     if prereq["auto"]:
-                        ctx_logger.info("Policy[B]: auto-injecting prereq", prereq=prereq_tool, for_tool=tc_name)
-                        self.ctx_id_to_pending_intent[ctx_id] = {
-                            "tool_name": tc_name,
-                            "args": tc_args,
-                            "prereq_tool": prereq_tool,
-                        }
-                        prereq_tc = {
-                            "id": str(uuid4()),
-                            "type": "function",
-                            "function": {
-                                "name": prereq_tool,
-                                "arguments": json.dumps(prereq.get("prereq_args", {})),
-                            },
-                        }
-                        return {"type": "replace_with_calls", "tool_calls": [prereq_tc]}
-                    else:
-                        ctx_logger.info("Policy[B]: need user info", prereq=prereq_tool, for_tool=tc_name)
-                        return {"type": "replace_with_text", "response": self._generate_clarification(messages, prereq["question_hint"], completion_kwargs)}
+                        missing_auto.append(prereq)
+                    elif missing_manual is None:
+                        missing_manual = prereq
+
+            if missing_auto:
+                prereq_tools = [p["requires_tool"] for p in missing_auto]
+                ctx_logger.info("Policy[B]: auto-injecting prereqs (batched)", prereqs=prereq_tools, for_tool=tc_name)
+                self.ctx_id_to_pending_intent[ctx_id] = {
+                    "tool_name": tc_name,
+                    "args": tc_args,
+                    "prereq_tools": prereq_tools,
+                }
+                prereq_tcs = [
+                    {
+                        "id": str(uuid4()),
+                        "type": "function",
+                        "function": {
+                            "name": p["requires_tool"],
+                            "arguments": json.dumps(p.get("prereq_args", {})),
+                        },
+                    }
+                    for p in missing_auto
+                ]
+                return {"type": "replace_with_calls", "tool_calls": prereq_tcs}
+            elif missing_manual is not None:
+                ctx_logger.info("Policy[B]: need user info", prereq=missing_manual["requires_tool"], for_tool=tc_name)
+                return {"type": "replace_with_text", "response": self._generate_clarification(messages, missing_manual["question_hint"], completion_kwargs)}
+
+            # ── Check G: mutual exclusion — high beams blocked while fog lights on (AUT-POL:014) ──
+            if tc_name == "set_head_lights_high_beams" and tc_args.get("on"):
+                lights = self._get_tool_result(ctx_id, "get_exterior_lights_status")
+                if lights.get("fog_lights") is True:
+                    ctx_logger.info("Policy[G]: high beams blocked, fog lights on")
+                    text = "I can't turn on the high beams while the fog lights are on — want me to turn those off first?"
+                    return {"type": "replace_with_text_literal", "text": text}
 
             # ── Check C: Missing response fields (hallucination_missing_tool_response fix) ──
             missing = self._check_missing_response_fields(ctx_id, tc_name)
             if missing:
                 ctx_logger.info("Policy[C]: missing response fields", tool=tc_name, missing=list(missing))
                 field_labels = [f.split(".", 1)[-1] for f in missing]
-                hint = (
-                    f"You need to use '{tc_name}' but a required piece of information is missing "
-                    f"from an earlier tool response ({', '.join(field_labels)}). "
-                    "Tell the driver honestly that you couldn't get all the info needed. Be brief."
+                text = (
+                    f"I wasn't able to confirm {', '.join(field_labels)} from the car, "
+                    "so I can't safely do that right now."
                 )
-                return {"type": "replace_with_text", "response": self._generate_clarification(messages, hint, completion_kwargs)}
+                return {"type": "replace_with_text_literal", "text": text}
 
             # ── Check E: Preference auto-injection ────────────────────────────────
             # If agent is about to call a preference-sensitive tool but hasn't
@@ -909,7 +1111,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 self.ctx_id_to_pending_intent[ctx_id] = {
                     "tool_name": tc_name,
                     "args": tc_args,
-                    "prereq_tool": "get_user_preferences",
+                    "prereq_tools": ["get_user_preferences"],
                 }
                 pref_tc = {
                     "id": str(uuid4()),
@@ -920,6 +1122,41 @@ class CARBenchAgentExecutor(AgentExecutor):
                     },
                 }
                 return {"type": "replace_with_calls", "tool_calls": [pref_tc]}
+
+        # ── Check H: nav-edit tools must not run in parallel (TECH-AUT-POL:018) ──
+        nav_edit_calls = [tc for tc in tool_calls if tc["function"]["name"] in NAVIGATION_EDIT_TOOLS]
+        if len(nav_edit_calls) > 1:
+            ctx_logger.info(
+                "Policy[H]: multiple nav-edit tools in parallel, keeping first only",
+                tools=[tc["function"]["name"] for tc in nav_edit_calls],
+            )
+            non_nav_calls = [tc for tc in tool_calls if tc["function"]["name"] not in NAVIGATION_EDIT_TOOLS]
+            return {"type": "replace_with_calls", "tool_calls": non_nav_calls + [nav_edit_calls[0]]}
+
+        # ── Check F: post-action side effects (AUT-POL:010/011/013) ──────────────
+        # All tool_calls in this batch passed A/B/C/E/G above, so any prereq state
+        # these side effects depend on is already cached in tool_history. Inject
+        # the dependent calls alongside the original ones in the same batch —
+        # the evaluator runs same-turn tool_calls in parallel.
+        extra_effects: list[tuple[str, dict]] = []
+        for tc in tool_calls:
+            tc_name_f = tc["function"]["name"]
+            try:
+                tc_args_f = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
+            except (json.JSONDecodeError, TypeError):
+                tc_args_f = {}
+            extra_effects.extend(self._compute_side_effects(ctx_id, tc_name_f, tc_args_f))
+
+        if extra_effects:
+            ctx_logger.info("Policy[F]: injecting side-effect calls", effects=[e[0] for e in extra_effects])
+            new_tool_calls = list(tool_calls)
+            for effect_name, effect_args in extra_effects:
+                new_tool_calls.append({
+                    "id": str(uuid4()),
+                    "type": "function",
+                    "function": {"name": effect_name, "arguments": json.dumps(effect_args)},
+                })
+            return {"type": "replace_with_calls", "tool_calls": new_tool_calls}
 
         # ── Check D: Disambiguation ───────────────────────────────────────────
         # Two-stage check:

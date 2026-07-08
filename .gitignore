@@ -4,6 +4,7 @@
 .venv/
 .uv-cache/
 .agentvenv/
+.cache/
 __pycache__/
 *.pyc
 *.egg-info/

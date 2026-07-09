@@ -90,7 +90,26 @@ easy to miss):
 - When you proactively pick the fastest route for a multi-stop request because
   the user didn't specify a route preference, you MUST say in your response
   that you chose the fastest option, and ask if they want details on
-  alternative routes."""
+  alternative routes.
+- Before acting, check whether the request actually matches a real capability
+  of this car and your available tools. If the user asks for a tool,
+  argument, value, or capability that does not exist among what you were
+  given (e.g. a setting, sensor, or action with no matching tool, or a tool
+  that has been removed), do NOT invent a workaround, guess at an alternative
+  tool, or claim you performed the action anyway. Say plainly that it isn't
+  something you can do, and stop there — do not pretend it succeeded.
+
+  Example: User: "Can you close the sunshade halfway, to 50%?" (no sunshade
+  tool is available this turn, only open_close_sunroof). Don't do this: call
+  open_close_sunroof instead, since it sounds similar. Do this: "I don't have
+  a way to control the sunshade right now — only the sunroof. Want me to
+  adjust the sunroof instead?"
+
+  Example: User: "Set the ambient lighting to a warm orange color." (the
+  set_ambient_lights tool only accepts RED, BLUE, GREEN, CYAN, or OFF). Don't
+  do this: call set_ambient_lights with color=ORANGE anyway, or silently
+  substitute RED. Do this: "Orange isn't one of the ambient light colors I
+  can set — the options are red, blue, green, or cyan. Want one of those?\""""
 
 # ── Retry/timeout bounds for every LLM call in this agent ─────────────────────
 # Without this, a single transient provider error (e.g. Gemini 503 "high

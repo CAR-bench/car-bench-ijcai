@@ -280,18 +280,36 @@ def main():
 
     finally:
         logger.info("Shutting down agents")
+        # Step 1: Graceful shutdown attempt
         for p in procs:
             if p.poll() is None:
                 try:
-                    os.killpg(p.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                    if hasattr(os, "killpg"):
+                        os.killpg(p.pid, signal.SIGTERM)
+                    else:
+                        p.terminate()
+                except (ProcessLookupError, PermissionError):
                     pass
+                    
         time.sleep(1)
+        
+        # Step 2: Forceful shutdown fallback
         for p in procs:
             if p.poll() is None:
                 try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    if hasattr(os, "killpg"):
+                        os.killpg(p.pid, signal.SIGKILL)
+                    else:
+                        if sys.platform == "win32":
+                            # Force kill process tree on Windows
+                            subprocess.call(
+                                ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL
+                            )
+                        else:
+                            p.kill()
+                except (ProcessLookupError, PermissionError):
                     pass
 
 

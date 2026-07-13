@@ -1,0 +1,30 @@
+{
+  "name": "car-bench-track1-xzlon",
+  "version": "1.0.0",
+  "description": "Defensive in-car voice assistant for CAR-bench Track 1 evaluation using deterministic code-level guardrails",
+  "author": "Team Xzlon",
+  "license": "MIT",
+  "repository": "https://github.com/Farrukh-Noor-Khan/car-bench-ijcai",
+  "agent": {
+    "type": "purple",
+    "protocol": "A2A",
+    "endpoint": {
+      "type": "docker",
+      "image": "ghcr.io/farrukh-noor-khan/car-bench-agent@sha256:9728694b55dbb72218ba9b7662591f2e8ad66045989fb8ada81d59041477af22"
+    },
+    "capabilities": {
+      "tool_use": true,
+      "multi_turn": true,
+      "streaming": false
+    },
+    "environment": {
+      "required": ["GEMINI_API_KEY"],
+      "optional": []
+    }
+  },
+  "benchmark": {
+    "name": "CAR-bench",
+    "track": "track_1",
+    "paper": "https://arxiv.org/abs/2506.04231"
+  }
+}

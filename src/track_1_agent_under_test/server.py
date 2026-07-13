@@ -21,7 +21,7 @@ from a2a.server.tasks import InMemoryTaskStore
 from a2a.server.routes import create_jsonrpc_routes, create_agent_card_routes
 from a2a.types import AgentCard
 
-from car_bench_agent import CARBenchAgentExecutor
+from src.track_1_agent_under_test.car_bench_agent import CARBenchAgentExecutor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from logging_utils import configure_logger
@@ -81,7 +81,7 @@ def main():
     # Support both command-line args and environment variables
     # Priority: CLI args > env vars > default
     import os
-    agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "gemini/gemini-2.5-flash")
+    agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "gemini/gemini-3.5-flash")
     completion_kwargs = {
         "temperature": args.temperature or os.getenv("AGENT_TEMPERATURE", None),
         "thinking": args.thinking or (os.getenv("AGENT_THINKING", "false").lower() == "true"),

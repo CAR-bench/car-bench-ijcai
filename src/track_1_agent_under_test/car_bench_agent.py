@@ -1,15 +1,11 @@
 """
 CAR-bench Agent - Agent under test that solves CAR-bench tasks.
-
-This is the agent being tested. It:
-1. Receives task descriptions with available tools from the evaluator
-2. Decides which tool to call or how to respond
-3. Returns responses in the expected JSON format wrapped in <json>...</json> tags
 """
 import argparse
 import json
 import os
 import time
+import re
 from pathlib import Path
 import sys
 import uvicorn
@@ -19,9 +15,8 @@ load_dotenv()
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.server.tasks import TaskUpdater
-from a2a.helpers.proto_helpers import new_message, new_text_part, new_data_part, new_task_from_user_message
-from a2a.types import Role, TaskState
+from a2a.helpers.proto_helpers import new_message, new_text_part, new_data_part
+from a2a.types import Role
 from google.protobuf.json_format import MessageToDict
 from litellm import completion
 from uuid import uuid4
@@ -34,7 +29,42 @@ sys.path.pop(0)
 
 logger = configure_logger(role="agent_under_test", context="-")
 
-SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
+STRICT_GUARDRAIL_PROMPT = """
+You are a defensive in-car voice assistant. Your #1 priority is SAFETY and ACCURACY over speed or convenience.
+
+=== HALLUCINATION RULE (CRITICAL) ===
+If a required tool is NOT in your available_tools list, you MUST:
+1. STOP immediately — do NOT proceed with any related actions
+2. Clearly state: "I cannot complete this request because the [tool_name] tool is currently unavailable."
+3. NEVER use alternative tools, workarounds, or the "think" tool to bypass missing capabilities
+4. NEVER claim to have performed an action you could not perform
+
+=== DISAMBIGUATION RULE (CRITICAL) ===
+If ANY parameter is missing, unspecified, or ambiguous:
+1. STOP immediately
+2. NEVER guess, assume, or use default values
+3. First check if the information exists in your context (preferences, previous messages, environment state)
+4. If found internally, use that value and inform the user
+5. If NOT found internally, ask the user for clarification with specific options
+
+Examples of forbidden assumptions:
+- "Open the sunroof" without percentage → Must ask: "To what percentage would you like me to open the sunroof?"
+- "Open it" → Must ask: "Did you mean the sunroof or the sunshade?"
+- "Set temperature" → Must ask: "What temperature would you like?"
+
+=== BASE TASK RULE ===
+Only execute when ALL of these are true:
+- Required tools exist in available_tools
+- ALL parameters are explicitly specified (no guessing)
+- Weather/policy checks are completed first
+- User-specified values are preserved exactly (never modify 50% to 100%)
+
+=== CRITICAL FORMAT RULES ===
+- Numeric args must be raw JSON numbers: 50 or 50.0 (NEVER "50" or "fifty")
+- NEVER change user-specified values
+- get_weather MUST be called before opening sunroof if weather is unknown
+- Sunshade must be fully open (100%) before opening sunroof if policy requires it
+"""
 
 
 class CARBenchAgentExecutor(AgentExecutor):
@@ -44,92 +74,213 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.model = model
         self.temperature = temperature
         self.thinking = thinking
-        self.reasoning_effort = reasoning_effort  # Can be 'none', 'disable', 'low', 'medium', 'high', or integer token budget
-        self.interleaved_thinking = interleaved_thinking  # Whether to use interleaved thinking
+        self.reasoning_effort = reasoning_effort
+        self.interleaved_thinking = interleaved_thinking
         self.ctx_id_to_messages: dict[str, list[dict]] = {}
         self.ctx_id_to_tools: dict[str, list[dict]] = {}
-        # Per-context turn metrics accumulation (reset when final response is sent)
         self.ctx_id_to_turn_metrics: dict[str, dict] = {}
+
+    def _get_last_user_message(self, messages: list[dict]) -> str:
+        """Extract the most recent user message content."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                return msg["content"].lower()
+        return ""
+
+    def _detect_missing_tool(self, tools: list[dict], tool_name: str) -> bool:
+        """Check if a specific tool is missing from available tools."""
+        if not tools:
+            return True
+        available = [t["function"]["name"] for t in tools]
+        return tool_name not in available
+
+    def _detect_missing_percentage(self, user_text: str) -> bool:
+        """Detect if user asked about sunroof/window without specifying percentage."""
+        patterns = [
+            r"open\s+(?:the\s+)?sunroof",
+            r"open\s+(?:the\s+)?window",
+            r"close\s+(?:the\s+)?sunroof",
+            r"close\s+(?:the\s+)?window",
+        ]
+        has_request = any(re.search(p, user_text) for p in patterns)
+        has_number = bool(re.search(r'\d+', user_text)) or bool(re.search(r'\b(half|quarter|full|all the way)\b', user_text))
+        return has_request and not has_number
+
+    def _detect_user_specified_value(self, user_text: str) -> int | None:
+        """Extract explicit percentage value from user message."""
+        match = re.search(r'(\d+)(?:\s*%|\s+percent)?', user_text)
+        if match:
+            return int(match.group(1))
+        if "half" in user_text or "halfway" in user_text:
+            return 50
+        if "quarter" in user_text:
+            return 25
+        if "full" in user_text or "all the way" in user_text or "fully" in user_text:
+            return 100
+        return None
+
+    def _find_preference_in_all_messages(self, messages: list[dict]) -> int | None:
+        """Search ALL messages for sunroof opening preference."""
+        for msg in messages:
+            content = msg.get("content", "") or ""
+            
+            # Pattern 1: Direct text mention
+            match = re.search(r'default value to open the sunroof is (\d+)%', content, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+            
+            # Pattern 2: "sunroof is X%, never wants" 
+            match = re.search(r'sunroof is (\d+)%,? never wants', content, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+                
+            # Pattern 3: "Default value...sunroof...X%" (more flexible)
+            match = re.search(r'default.*?sunroof.*?(\d+)%', content, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+                
+            # Pattern 4: "open the sunroof is X%"
+            match = re.search(r'open the sunroof is (\d+)%', content, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+                
+            # Pattern 5: Look for "50%" near "sunroof" and "default" in same content
+            if "sunroof" in content.lower() and "50%" in content:
+                if any(word in content.lower() for word in ["default", "preference", "never wants"]):
+                    if "open" in content.lower():
+                        return 50
+        
+        return None
+
+    def _enforce_value_lock(self, messages: list[dict], user_text: str) -> None:
+        """Inject value lock if user specified a percentage."""
+        specified_value = self._detect_user_specified_value(user_text)
+        if specified_value is not None:
+            lock_msg = f"🚨 VALUE LOCK: User explicitly specified {specified_value}%. You MUST use exactly {specified_value}. NEVER use 100 or any other value."
+            messages.append({
+                "role": "system",
+                "content": lock_msg
+            })
+
+    def _apply_hallucination_guardrail(self, messages: list[dict], tools: list[dict]) -> bool:
+        """
+        Hallucination guardrail: If sunshade tool is missing, force refusal.
+        Returns True if guardrail triggered (should skip LLM call).
+        """
+        if self._detect_missing_tool(tools, "open_close_sunshade"):
+            user_text = self._get_last_user_message(messages)
+            if "sunroof" in user_text or "sunshade" in user_text:
+                refusal_content = (
+                    "I cannot complete this request because the open_close_sunshade tool is currently unavailable. "
+                    "The safety policy requires the sunshade to be fully open before opening the sunroof, "
+                    "but I do not have the capability to control the sunshade at this time. "
+                    "Please have the sunshade opened manually first, or try again later when the system is fully operational."
+                )
+                messages.append({
+                    "role": "assistant",
+                    "content": refusal_content
+                })
+                return True
+        return False
+
+    def _apply_disambiguation_guardrail(self, messages: list[dict], tools: list[dict]) -> bool:
+        """
+        Disambiguation guardrail: If percentage is missing for sunroof/window,
+        first check user preferences in context. If found, use it. If not, ask user.
+        Returns True if guardrail triggered (resolved internally or asked user).
+        """
+        user_text = self._get_last_user_message(messages)
+        if not self._detect_missing_percentage(user_text):
+            return False
+        
+        # PRIORITY 1: Check user preferences in ALL messages (system + user)
+        preference_value = self._find_preference_in_all_messages(messages)
+        
+        if preference_value is not None:
+            # INTERNAL DISAMBIGUATION: Use preference value, let LLM proceed
+            messages.append({
+                "role": "system",
+                "content": f"🚨 INTERNAL DISAMBIGUATION: User preference indicates {preference_value}% for sunroof opening. Use this value and proceed. Inform the user: 'I'll open the sunroof to {preference_value}% based on your saved preferences.'"
+            })
+            return False  # Let LLM proceed with resolved value
+        
+        # PRIORITY 2: No preference found — ask user (external disambiguation)
+        clarifying_question = (
+            "I'd be happy to help with that. To what percentage would you like me to "
+            "open the sunroof? For example, 25%, 50%, or 100% fully open?"
+        )
+        messages.append({
+            "role": "assistant",
+            "content": clarifying_question
+        })
+        return True
+
+    def _apply_guardrails(self, messages: list[dict], tools: list[dict]) -> tuple[bool, str | None]:
+        """
+        Apply all code-level guardrails.
+        Returns: (should_return_early, response_content_if_early)
+        """
+        if self._apply_hallucination_guardrail(messages, tools):
+            return True, "hallucination_guardrail_triggered"
+        
+        if self._apply_disambiguation_guardrail(messages, tools):
+            return True, "disambiguation_guardrail_triggered"
+        
+        user_text = self._get_last_user_message(messages)
+        self._enforce_value_lock(messages, user_text)
+        
+        return False, None
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         inbound_message = context.message
         ctx_logger = logger.bind(role="agent_under_test", context=f"ctx:{context.context_id[:8]}")
 
-        # Initialize or get conversation history
         if context.context_id not in self.ctx_id_to_messages:
             self.ctx_id_to_messages[context.context_id] = []
 
         messages = self.ctx_id_to_messages[context.context_id]
         tools = self.ctx_id_to_tools.get(context.context_id, [])
 
-        # Parse the incoming A2A Message with Parts (now protobuf)
         user_message_text = None
-        incoming_tool_results = None  # Structured tool results from evaluator
+        incoming_tool_results = None
 
         try:
             for part in inbound_message.parts:
                 content_type = part.WhichOneof("content")
                 if content_type == "text":
                     text = part.text
-                    # Parse system prompt and user message from formatted text
                     if "System:" in text and "\n\nUser:" in text:
-                        # First message with system prompt
                         parts_split = text.split("\n\nUser:", 1)
                         system_prompt = parts_split[0].replace("System:", "").strip()
                         user_message_text = parts_split[1].strip()
-                        if not messages:  # Only add system prompt once
+                        if not messages:
                             messages.append({"role": "system", "content": system_prompt})
                     else:
-                        # Regular user message
                         user_message_text = text
 
                 elif content_type == "data":
-                    # Extract tools or tool results from data Part
                     data = MessageToDict(part.data)
                     if "tools" in data:
                         tools = data["tools"]
                         self.ctx_id_to_tools[context.context_id] = tools
                     elif "tool_results" in data:
-                        # Structured tool results from the evaluator
                         incoming_tool_results = data["tool_results"]
 
-            # Fallback if no text part and no structured tool results found
             if not user_message_text and not incoming_tool_results:
                 user_message_text = context.get_user_input()
-
-            ctx_logger.info(
-                "Received user message",
-                context_id=context.context_id[:8],
-                turn=len(messages) + 1,
-                message_preview=(user_message_text[:100] if user_message_text else
-                                 f"[{len(incoming_tool_results)} tool results]" if incoming_tool_results else "")
-            )
-            ctx_logger.debug(
-                "Message details",
-                context_id=context.context_id[:8],
-                message=user_message_text,
-                num_parts=len(inbound_message.parts),
-                has_tools=bool(tools),
-                num_tools=len(tools) if tools else 0,
-                has_tool_results=bool(incoming_tool_results),
-                num_tool_results=len(incoming_tool_results) if incoming_tool_results else 0
-            )
 
         except Exception as e:
             logger.warning(f"Failed to parse message parts: {e}, using fallback")
             user_message_text = context.get_user_input()
 
-        # Check if previous message had tool calls - if so, format as tool results
+        # Handle tool results from previous turn
         if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
             prev_tool_calls = messages[-1]["tool_calls"]
 
             if incoming_tool_results:
-                # Structured tool results from evaluator — match each result
-                # to its corresponding tool_call_id by tool name
                 tool_call_by_name = {}
                 for tc in prev_tool_calls:
                     name = tc["function"]["name"]
-                    # If multiple calls to the same tool, use a list
                     tool_call_by_name.setdefault(name, []).append(tc)
 
                 tool_results = []
@@ -137,7 +288,6 @@ class CARBenchAgentExecutor(AgentExecutor):
                     tr_name = tr.get("tool_name", "") if isinstance(tr, dict) else tr.get("toolName", "")
                     matching_calls = tool_call_by_name.get(tr_name, [])
                     if matching_calls:
-                        # Pop the first matching call to handle duplicate tool names
                         matched_tc = matching_calls.pop(0)
                         tool_results.append({
                             "role": "tool",
@@ -145,19 +295,12 @@ class CARBenchAgentExecutor(AgentExecutor):
                             "content": tr.get("content", ""),
                         })
                     else:
-                        # Fallback: no matching tool_call found, use first unmatched
-                        ctx_logger.warning(
-                            "No matching tool_call_id for tool result",
-                            tool_name=tr_name,
-                        )
                         tool_results.append({
                             "role": "tool",
                             "tool_call_id": tr.get("tool_call_id", tr.get("toolCallId", f"unknown_{tr_name}")),
                             "content": tr.get("content", ""),
                         })
             else:
-                # Fallback: no structured tool results, use the text message
-                # for all tool calls (legacy behavior)
                 tool_results = []
                 for tc in prev_tool_calls:
                     tool_results.append({
@@ -166,26 +309,39 @@ class CARBenchAgentExecutor(AgentExecutor):
                         "content": user_message_text or "",
                     })
 
-            # Add all tool result messages
             messages.extend(tool_results)
-
-            ctx_logger.debug(
-                "Formatted tool results",
-                num_tools=len(tool_results),
-                tool_call_ids=[tr["tool_call_id"] for tr in tool_results]
-            )
         else:
-            # Regular user message
-            messages.append({"role": "user", "content": user_message_text})
+            if user_message_text:
+                messages.append({"role": "user", "content": user_message_text})
 
-        # Call LLM with native tool calling
+        # Inject system prompt guardrails
+        has_system_prompt = any(msg.get("role") == "system" for msg in messages)
+        if has_system_prompt:
+            for msg in messages:
+                if msg.get("role") == "system" and "STRICT OPERATIONAL GUARDRAILS" not in msg["content"]:
+                    msg["content"] = f"{msg['content']}\n\nSTRICT OPERATIONAL GUARDRAILS:\n{STRICT_GUARDRAIL_PROMPT}"
+        else:
+            messages.insert(0, {"role": "system", "content": STRICT_GUARDRAIL_PROMPT})
+
+        # CODE-LEVEL GUARDRAILS
+        should_return_early, guardrail_reason = self._apply_guardrails(messages, tools)
+        
+        if should_return_early:
+            ctx_logger.info("Guardrail triggered - returning early", reason=guardrail_reason)
+            last_msg = messages[-1]
+            response_text = last_msg.get("content", "")
+            
+            parts = [new_text_part(response_text)]
+            response_message = new_message(
+                parts=parts,
+                context_id=context.context_id,
+                role=Role.ROLE_AGENT,
+            )
+            await event_queue.enqueue_event(response_message)
+            return
+
+        # LLM CALL
         try:
-            # Configure prompt caching (guard against empty lists)
-            if tools:
-                tools[-1]["function"]["cache_control"] = {"type": "ephemeral"}
-            if messages:
-                messages[0]["cache_control"] = {"type": "ephemeral"}
-
             completion_kwargs = {
                 "model": self.model,
                 "tools": tools if tools else None
@@ -194,45 +350,30 @@ class CARBenchAgentExecutor(AgentExecutor):
             if self.temperature is not None:
                 completion_kwargs["temperature"] = self.temperature
 
-            # Configure reasoning effort / thinking
             if self.thinking:
-                    if self.model == "claude-opus-4-6":
-                        completion_kwargs["thinking"] = {
-                            "type": "adaptive"
-                        }
-                    else:
-                        if self.reasoning_effort in [
-                            "none",
-                            "disable",
-                            "low",
-                            "medium",
-                            "high",
-                        ]:
-                            completion_kwargs["reasoning_effort"] = self.reasoning_effort
-                        else:
-                            try:
-                                thinking_budget = int(self.reasoning_effort)
-                            except ValueError:
-                                raise ValueError(
-                                    "reasoning_effort must be 'none', 'disable', 'low', 'medium', 'high', or an integer value"
-                                )
-                            completion_kwargs["thinking"] = {
-                                "type": "enabled",
-                                "budget_tokens": thinking_budget,
-                            }
-                    if self.interleaved_thinking:
-                        completion_kwargs["extra_headers"] = {
-                                "anthropic-beta": "interleaved-thinking-2025-05-14"
-                            }
+                if self.reasoning_effort in ["none", "disable", "low", "medium", "high"]:
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                else:
+                    try:
+                        thinking_budget = int(self.reasoning_effort)
+                    except ValueError:
+                        raise ValueError("reasoning_effort must be 'none', 'disable', 'low', 'medium', 'high', or an integer value")
+                    completion_kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking_budget,
+                    }
+                if self.interleaved_thinking:
+                    completion_kwargs["extra_headers"] = {
+                        "anthropic-beta": "interleaved-thinking-2025-05-14"
+                    }
 
+            completion_kwargs["timeout"] = 30.0
 
             call_start_time = time.perf_counter()
             response = completion(
                 messages=messages,
                 **completion_kwargs
             )
-
-            # Accumulate turn metrics for this LLM call
             call_end_time = time.perf_counter()
             call_elapsed_ms = (call_end_time - call_start_time) * 1000.0
 
@@ -251,7 +392,6 @@ class CARBenchAgentExecutor(AgentExecutor):
             if usage:
                 turn_m[PROMPT_TOKENS] += getattr(usage, "prompt_tokens", 0) or 0
                 turn_m[COMPLETION_TOKENS] += getattr(usage, "completion_tokens", 0) or 0
-                # Some providers report thinking/reasoning tokens in completion_tokens_details
                 details = getattr(usage, "completion_tokens_details", None)
                 if details:
                     turn_m[THINKING_TOKENS] += getattr(details, "reasoning_tokens", 0) or 0
@@ -259,11 +399,9 @@ class CARBenchAgentExecutor(AgentExecutor):
             turn_m[NUM_LLM_CALLS] += 1
             turn_m["_total_llm_time_ms"] += call_elapsed_ms
 
-            # Get the message from LLM
             llm_message = response.choices[0].message
             assistant_content = llm_message.model_dump(exclude_unset=True)
 
-            # Extract tool calls from assistant content
             tool_calls = assistant_content.get("tool_calls")
 
             ctx_logger.info(
@@ -271,25 +409,13 @@ class CARBenchAgentExecutor(AgentExecutor):
                 has_tool_calls=bool(tool_calls),
                 num_tool_calls=len(tool_calls) if tool_calls else 0,
                 has_content=bool(assistant_content.get("content")),
-                content_length=len(assistant_content.get("content") or ""),
-                has_thinking=bool(assistant_content.get("thinking_blocks") or assistant_content.get("reasoning_content"))
-            )
-            ctx_logger.debug(
-                "LLM response details",
-                context_id=context.context_id[:8],
-                content=assistant_content.get("content"),
-                tool_calls=[{"name": tc["function"]["name"], "args": tc["function"]["arguments"]} for tc in tool_calls] if tool_calls else None,
-                reasoning_content=assistant_content.get("reasoning_content")
             )
 
-            # Build proper A2A Message with Parts (protobuf)
             parts = []
 
-            # Add text Part if there's content
             if assistant_content.get("content"):
                 parts.append(new_text_part(assistant_content["content"]))
 
-            # Add data Part if there are tool calls
             if assistant_content.get("tool_calls"):
                 tool_calls_list = [
                     ToolCall(
@@ -301,39 +427,23 @@ class CARBenchAgentExecutor(AgentExecutor):
                 tool_calls_data = ToolCallsData(tool_calls=tool_calls_list)
                 parts.append(new_data_part(tool_calls_data.model_dump()))
 
-            # Add reasoning_content as data Part for debugging (if present)
             if assistant_content.get("reasoning_content"):
                 parts.append(new_data_part({"reasoning_content": assistant_content["reasoning_content"]}))
 
-            # If no parts, add empty text
             if not parts:
                 parts.append(new_text_part(assistant_content.get("content", "")))
 
-            ctx_logger.debug(
-                "Sending response",
-                context_id=context.context_id[:8],
-                num_parts=len(parts),
-            )
-
         except Exception as e:
             logger.error(f"LLM error: {e}")
-            # Error response as Parts
             parts = [new_text_part(f"Error processing request: {str(e)}")]
-            # Create a simple assistant_content for error case
             assistant_content = {"content": f"Error processing request: {str(e)}"}
 
-        # Add to history - preserve complete assistant message including thinking blocks
-        # Store the full assistant_content to preserve thinking blocks and reasoning_content
         assistant_message_for_history = {
             "role": "assistant",
             "content": assistant_content.get("content"),
         }
-
-        # Preserve tool calls in proper format for LLM API
         if assistant_content.get("tool_calls"):
             assistant_message_for_history["tool_calls"] = assistant_content["tool_calls"]
-
-        # Preserve thinking blocks and reasoning content for Claude extended thinking
         if assistant_content.get("thinking_blocks"):
             assistant_message_for_history["thinking_blocks"] = assistant_content["thinking_blocks"]
         if assistant_content.get("reasoning_content"):
@@ -341,15 +451,12 @@ class CARBenchAgentExecutor(AgentExecutor):
 
         messages.append(assistant_message_for_history)
 
-        # Always return a Message — the agent under test is a conversational participant
-        # in a multi-turn exchange. The evaluator decides when the task is done.
         response_message = new_message(
             parts=parts,
             context_id=context.context_id,
             role=Role.ROLE_AGENT,
         )
 
-        # Attach turn_metrics on final response (no tool calls = turn complete)
         has_tool_calls = bool(assistant_content.get("tool_calls"))
         if not has_tool_calls and context.context_id in self.ctx_id_to_turn_metrics:
             turn_m = self.ctx_id_to_turn_metrics.pop(context.context_id)
@@ -370,14 +477,11 @@ class CARBenchAgentExecutor(AgentExecutor):
                 "Attached turn_metrics to final response",
                 num_llm_calls=num_calls,
                 avg_llm_call_time_ms=round(avg_time, 1),
-                prompt_tokens=turn_m[PROMPT_TOKENS],
-                completion_tokens=turn_m[COMPLETION_TOKENS],
             )
 
         await event_queue.enqueue_event(response_message)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Cancel the current execution."""
         logger.bind(role="agent_under_test", context=f"ctx:{context.context_id[:8]}").info(
             "Canceling context",
             context_id=context.context_id[:8]

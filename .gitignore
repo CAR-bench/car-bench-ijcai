@@ -22,3 +22,4 @@ docker-compose.yml
 a2a-scenario.toml
 scenarios/**/docker-compose.yml
 scenarios/**/a2a-scenario.toml
+.env

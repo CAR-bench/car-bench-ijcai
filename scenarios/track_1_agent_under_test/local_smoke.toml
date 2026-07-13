@@ -3,11 +3,11 @@
 
 [evaluator]
 endpoint = "http://127.0.0.1:8081"
-cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
+cmd = "uv run python -m src.evaluator.server --host 127.0.0.1 --port 8081"
 
 [agent_under_test]
 endpoint = "http://127.0.0.1:8080"
-cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm azure/gpt-5.5"
+cmd = "uv run python -m src.track_1_agent_under_test.server --host 127.0.0.1 --port 8080 --agent-llm gemini/gemini-3.5-flash"
 
 [config]
 num_trials = 1

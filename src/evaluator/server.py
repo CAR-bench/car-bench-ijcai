@@ -24,8 +24,8 @@ from a2a.server.routes import create_jsonrpc_routes, create_agent_card_routes
 from a2a.types import AgentCard
 
 from agentbeats.evaluator_executor import EvaluatorExecutor
-from car_bench_paths import CAR_BENCH_DATA_DIR, SETUP_SCRIPT
-from car_bench_evaluator import CARBenchEvaluator
+from src.evaluator.car_bench_paths import CAR_BENCH_DATA_DIR, SETUP_SCRIPT
+from src.evaluator.car_bench_evaluator import CARBenchEvaluator
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from logging_utils import configure_logger

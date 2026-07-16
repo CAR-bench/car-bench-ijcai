@@ -24,6 +24,7 @@ from a2a.types import AgentCard
 from car_bench_agent import CARBenchAgentExecutor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import evaluator.gemini_key_rotation  # noqa: F401 — rotate Gemini keys on 429
 from logging_utils import configure_logger
 sys.path.pop(0)
 

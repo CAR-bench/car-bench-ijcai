@@ -319,6 +319,7 @@ car-bench-evaluator = [
     { name = "nest-asyncio" },
 ]
 track-1-agent = [
+    { name = "diskcache" },
     { name = "google-adk" },
     { name = "google-genai" },
     { name = "litellm" },
@@ -338,6 +339,7 @@ requires-dist = [
     { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.0.0" },
     { name = "car-bench", marker = "extra == 'car-bench-evaluator'", directory = "third_party/car-bench" },
     { name = "cerebras-cloud-sdk", marker = "extra == 'track-2-agent'", specifier = ">=1.50.0" },
+    { name = "diskcache", marker = "extra == 'track-1-agent'", specifier = ">=5.6.3" },
     { name = "google-adk", marker = "extra == 'track-1-agent'", specifier = ">=1.14.1" },
     { name = "google-genai", marker = "extra == 'track-1-agent'", specifier = ">=1.36.0" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -759,6 +761,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/12/80/630b4b88364e9a8c8c5797f4602d0f76ef820909ee32f0bacb9f90654042/dill-0.4.0.tar.gz", hash = "sha256:0633f1d2df477324f53a895b02c901fb961bdbf65a17122586ea7019292cbcf0", size = 186976, upload-time = "2025-04-16T00:41:48.867Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/50/3d/9373ad9c56321fdab5b41197068e1d8c25883b3fea29dd361f9b55116869/dill-0.4.0-py3-none-any.whl", hash = "sha256:44f54bf6412c2c8464c14e8243eb163690a9800dbe2c367330883b19c7561049", size = 119668, upload-time = "2025-04-16T00:41:47.671Z" },
+]
+
+[[package]]
+name = "diskcache"
+version = "5.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/21/1c1ffc1a039ddcc459db43cc108658f32c57d271d7289a2794e401d0fdb6/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc", size = 67916, upload-time = "2023-08-31T06:12:00.316Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19", size = 45550, upload-time = "2023-08-31T06:11:58.822Z" },
 ]
 
 [[package]]

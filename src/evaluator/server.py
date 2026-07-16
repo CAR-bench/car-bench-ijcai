@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 import warnings
 
+# Activate Gemini key rotation before any litellm calls
+import evaluator.gemini_key_rotation  # noqa: F401
+
 import uvicorn
 from starlette.applications import Starlette
 

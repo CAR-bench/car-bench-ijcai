@@ -22,6 +22,7 @@ track-1-agent = [
     "google-adk>=1.14.1",
     "google-genai>=1.36.0",
     "litellm>=1.85.1",
+    "diskcache>=5.6.3",
 ]
 track-2-agent = [
     "cerebras-cloud-sdk>=1.50.0",

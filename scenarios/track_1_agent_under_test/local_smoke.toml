@@ -1,5 +1,6 @@
 # Local smoke scenario for the baseline LiteLLM agent under test.
 # Runs one train task from each CAR-bench task type.
+# Using Groq (free tier)
 
 [evaluator]
 endpoint = "http://127.0.0.1:8081"
@@ -7,7 +8,7 @@ cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
 
 [agent_under_test]
 endpoint = "http://127.0.0.1:8080"
-cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm azure/gpt-5.5"
+cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm groq/llama-3.1-8b-instant"
 
 [config]
 num_trials = 1
@@ -16,3 +17,7 @@ tasks_base_num_tasks = 1
 tasks_hallucination_num_tasks = 1
 tasks_disambiguation_num_tasks = 1
 max_steps = 50
+user_model = "groq/llama-3.1-8b-instant"
+user_provider = "groq"
+policy_evaluator_model = "groq/llama-3.1-8b-instant"
+policy_evaluator_provider = "groq"

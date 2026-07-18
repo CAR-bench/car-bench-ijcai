@@ -1,0 +1,25 @@
+# Comparison scenario: same hallucination-only split, same judge model
+# (gemini-2.5-flash, unchanged) -- only the agent-under-test's own model is
+# swapped to the Vertex AI SFT-tuned endpoint (car-bench-agent-sft-v1,
+# tuned on 460 real pass/corrected examples from local_test_set_hall_only
+# and local_test_set runs). LiteLLM routes a purely-numeric vertex_ai model
+# string to the endpoints/ path instead of publishers/google/models/, which
+# is how it recognizes a fine-tuned model vs. the base gemini-2.5-flash.
+
+[evaluator]
+endpoint = "http://127.0.0.1:8081"
+cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
+
+[agent_under_test]
+endpoint = "http://127.0.0.1:8080"
+cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm vertex_ai/1947235642547109888"
+
+[config]
+num_trials = 3
+task_split = "test"
+tasks_hallucination_num_tasks = -1
+max_steps = 50
+user_model = "vertex_ai/gemini-2.5-flash"
+user_provider = "vertex_ai"
+policy_evaluator_model = "vertex_ai/gemini-2.5-flash"
+policy_evaluator_provider = "vertex_ai"

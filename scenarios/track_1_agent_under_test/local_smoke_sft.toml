@@ -1,0 +1,21 @@
+# Fast sanity check for the SFT-tuned model (car-bench-agent-sft-v1) --
+# one task per category, one trial. Run this BEFORE committing to the full
+# multi-hour local_test_set_sft.toml run, given raw ad-hoc testing showed the
+# tuned model can occasionally produce rambling/self-contradictory output
+# for a bare prompt. If this smoke run looks broken, don't run the full set.
+
+[evaluator]
+endpoint = "http://127.0.0.1:8081"
+cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
+
+[agent_under_test]
+endpoint = "http://127.0.0.1:8080"
+cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm vertex_ai/1947235642547109888"
+
+[config]
+num_trials = 1
+task_split = "train"
+tasks_base_num_tasks = 1
+tasks_hallucination_num_tasks = 1
+tasks_disambiguation_num_tasks = 1
+max_steps = 50

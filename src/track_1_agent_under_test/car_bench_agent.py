@@ -73,7 +73,7 @@ sys.path.pop(0)
 
 logger = configure_logger(role="agent_under_test", context="-")
 
-SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
+SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided. When requests are vague or ambiguous, ask ONE clarifying question before acting."""
 
 # Appended to the evaluator's own wiki system prompt. Re-emphasizes rules that
 # are already stated in the wiki (LLM-POL:002, LLM-POL:022) but were observed
@@ -131,6 +131,222 @@ easy to miss):
   do this: call set_ambient_lights with color=ORANGE anyway, or silently
   substitute RED. Do this: "Orange isn't one of the ambient light colors I
   can set — the options are red, blue, green, or cyan. Want one of those?\""""
+
+# ── Few-shot examples for disambiguation tasks (Check D improvement) ────────
+DISAMBIGUATION_PROMPT = """
+
+DISAMBIGUATION HANDLING (when requests are vague or ambiguous):
+
+When a user request is unclear or could mean multiple things, ask ONE clarifying 
+question BEFORE calling any tool. Your goal is to narrow down their intent with 
+a single yes/no or binary choice question.
+
+KEY PRINCIPLE: Never guess. Ask first when uncertain.
+
+════════════════════════════════════════════════════════════════════════════
+
+EXAMPLE 1 (Temperature ambiguity):
+  User: "I'm getting too warm"
+  ✅ CORRECT: "Should I reduce the cabin temperature, or would you prefer I 
+             open the windows for fresh air?"
+  ❌ WRONG: Just calling set_temperature without asking
+  ❌ WRONG: Asking "What temperature?" (too vague)
+
+EXAMPLE 2 (Visibility ambiguity):
+  User: "I can't see well"
+  ✅ CORRECT: "Would you like me to turn on the headlights, or should I 
+             activate the windshield defrost?"
+  ❌ WRONG: Guessing it's about headlights
+  ❌ WRONG: Asking 3+ questions
+
+EXAMPLE 3 (Comfort ambiguity):
+  User: "It's uncomfortable"
+  ✅ CORRECT: "Are you too hot or too cold? That will help me adjust either 
+             the temperature or seat heating."
+  ❌ WRONG: "What do you mean?" (not helpful)
+  ❌ WRONG: Calling multiple tools at once
+
+EXAMPLE 4 (Air quality ambiguity):
+  User: "The air in here feels bad"
+  ✅ CORRECT: "Would you like me to open windows for fresh air, or turn on 
+             air circulation mode?"
+  ❌ WRONG: Opening windows without asking
+  ❌ WRONG: Claiming there's a tool that doesn't exist
+
+EXAMPLE 5 (Noise ambiguity):
+  User: "It's too noisy"
+  ✅ CORRECT: "Should I close the windows to block road noise, or lower the 
+             climate fan speed?"
+  ❌ WRONG: Just closing windows
+  ❌ WRONG: Asking "What noise?" (not narrow enough)
+
+EXAMPLE 6 (Lighting ambiguity):
+  User: "It's too dark in here"
+  ✅ CORRECT: "Would you like me to turn on the interior lighting, or adjust 
+             the ambient lights?"
+  ❌ WRONG: Guessing which one
+  ❌ WRONG: Turning on all lights at once
+
+════════════════════════════════════════════════════════════════════════════
+
+RULES FOR ASKING CLARIFYING QUESTIONS:
+
+✓ Ask exactly ONE question (never 2-3 separate questions)
+✓ Make it binary or yes/no (not open-ended like "What do you want?")
+✓ Reference specific car SYSTEMS (AC, windows, lights, seats, etc.)
+✓ Use natural language (like talking to a friend, not robotic)
+✓ When genuinely uncertain about multiple interpretations, ask rather than guess
+✓ Keep the question SHORT (1-2 sentences maximum)
+✓ NEVER name a tool that doesn't exist (hallucination risk!)
+✓ Be CONSISTENT — same vague input should get the same clarification (Pass³)
+
+ANTI-PATTERNS (What NOT to do):
+
+✗ "Can you clarify?" — too vague, doesn't help
+✗ "What do you mean?" — not specific enough
+✗ "I don't understand" — unhelpful, admit limitations differently
+✗ "Should I turn on heating, cooling, adjust windows, and open sunroof?" — too many options
+✗ Calling a tool that doesn't exist (e.g., "activate_air_purifier" if it's not available)
+✗ Guessing when you're uncertain
+✗ Asking 3+ questions instead of 1
+✗ Asking an open-ended question like "What temperature?"
+
+════════════════════════════════════════════════════════════════════════════
+
+CONSISTENCY FOR Pass³:
+
+Since Pass³ requires the SAME behavior all 3 trials:
+→ If you ask "Should I increase temperature?" on Trial 1,
+  you MUST ask the same question on Trials 2 and 3.
+→ If you guess wrong on Trial 1,
+  you will get it wrong all 3 trials.
+→ Better to ask every time than guess inconsistently.
+"""
+
+# ── Cached clarifications for common vague requests (deterministic Pass³) ────
+# Maps vague keywords → cached clarification question. This ensures:
+# 1. Deterministic answers (same every time for Pass³)
+# 2. Fast inference (no LLM call needed for common cases)
+# 3. Proven good questions (mined from successful cases)
+CLARIFICATION_CACHE = {
+    # ════ TEMPERATURE/COMFORT KEYWORDS ════
+    "cold": "Should I increase the cabin temperature, or turn on seat heating?",
+    "warm": "Should I reduce the cabin temperature, or open the windows for air?",
+    "hot": "Should I reduce the cabin temperature, or open the windows?",
+    "cool": "Should I increase the cabin temperature, or turn on seat heating?",
+    "temperature": "Are you trying to adjust cabin temperature or seat heating?",
+    "freezing": "Should I increase cabin temperature or activate seat heating?",
+    "overheating": "Should I reduce temperature or open windows?",
+    "chilly": "Should I increase cabin temperature or turn on seat heating?",
+    "stuffy": "Would you like me to open windows or turn on air circulation?",
+    "muggy": "Should I open windows or turn on air conditioning?",
+    "humid": "Should I open windows or activate air conditioning?",
+    
+    # ════ VISIBILITY/LIGHTING KEYWORDS ════
+    "see": "Would you like me to turn on headlights, or activate windshield defrost?",
+    "dark": "Would you like me to turn on headlights, or increase interior lighting?",
+    "foggy": "Should I activate windshield defrost, or turn on headlights?",
+    "fog": "Should I activate windshield defrost, or turn on headlights?",
+    "visibility": "Should I activate windshield defrost or turn on headlights?",
+    "hazy": "Should I activate defrost or turn on headlights?",
+    "mist": "Should I activate windshield defrost or turn on headlights?",
+    "condensation": "Should I activate windshield defrost?",
+    "frost": "Should I activate windshield defrost?",
+    "light": "Would you like me to adjust headlights or interior ambient lighting?",
+    "bright": "Should I dim interior lighting or reduce headlight brightness?",
+    "glare": "Should I reduce interior lighting or adjust headlights?",
+    "dim": "Should I increase interior lighting or turn on ambient lights?",
+    "dark interior": "Would you like interior lighting or ambient lights?",
+    "can't see": "Would you like headlights or windshield defrost activated?",
+    "unclear": "Should I activate defrost or turn on headlights?",
+    
+    # ════ AIR QUALITY/VENTILATION KEYWORDS ════
+    "air": "Would you like me to open windows for fresh air, or turn on air circulation?",
+    "stale": "Would you like windows open or air circulation mode activated?",
+    "smell": "Would you prefer I open windows for fresh air, or use circulation mode?",
+    "odor": "Should I open windows or turn on air circulation?",
+    "stuffy air": "Should I open windows or activate air circulation?",
+    "ventilation": "Would you like windows open or air circulation mode?",
+    "circulation": "Should I open windows or turn on air circulation?",
+    "fresh air": "Should I open windows or turn on circulation mode?",
+    "oxygen": "Should I open windows or activate air circulation?",
+    "breathe": "Would you like windows open or air circulation turned on?",
+    "nasty": "Should I open windows or turn on circulation?",
+    "yuck": "Should I open windows or activate circulation?",
+    "vent": "Should I open windows or turn on circulation mode?",
+    
+    # ════ NOISE KEYWORDS ════
+    "loud": "Should I close windows to reduce road noise, or lower the climate fan?",
+    "noise": "Should I close windows to reduce road noise, or lower the climate fan?",
+    "quiet": "Should I close windows or reduce climate fan speed?",
+    "sound": "Should I close windows to reduce noise, or lower the fan?",
+    "noisy": "Should I close windows or lower the climate fan?",
+    "silence": "Should I close windows or reduce fan speed?",
+    "shush": "Should I close windows or lower the fan?",
+    "mute": "Should I close windows or reduce climate fan?",
+    "quieter": "Should I close windows or lower the climate fan?",
+    
+    # ════ GENERAL COMFORT KEYWORDS ════
+    "uncomfortable": "Are you too hot or too cold?",
+    "discomfort": "Are you too hot or too cold?",
+    "not comfortable": "Are you too hot or too cold?",
+    "adjust": "What would you like me to adjust — temperature, lighting, or ventilation?",
+    "change": "What would you like me to adjust — temperature, lighting, or ventilation?",
+    "different": "What would you like me to change?",
+    "better": "What adjustment would make you more comfortable?",
+    "worse": "What's bothering you — temperature, lighting, or air?",
+    "help": "What can I help adjust for your comfort?",
+    "fix": "What needs fixing — temperature, lighting, or ventilation?",
+    
+    # ════ NAVIGATION KEYWORDS ════
+    "navigate": "Where would you like me to navigate to?",
+    "route": "Where's your destination?",
+    "go": "Where would you like me to navigate?",
+    "destination": "Where are we heading?",
+    "directions": "Where would you like to go?",
+    "drive": "Where should I navigate to?",
+    "trip": "Where's your destination?",
+    "travel": "Where would you like to go?",
+    
+    # ════ CLIMATE CONTROL KEYWORDS ════
+    "fan": "Would you like me to adjust fan speed or change the airflow direction?",
+    "airflow": "Should I change airflow direction or adjust fan speed?",
+    "ac": "Should I turn on the AC or adjust the fan settings?",
+    "air conditioning": "Should I turn on AC or adjust fan settings?",
+    "blow": "Should I increase fan speed or change airflow direction?",
+    "wind": "Should I adjust fan speed or change airflow direction?",
+    "breeze": "Should I increase fan speed or adjust airflow direction?",
+    "air flow": "Should I change airflow direction or adjust fan speed?",
+    "circulation mode": "Should I turn on circulation mode?",
+    
+    # ════ SEAT/STEERING HEATING ════
+    "seat": "Would you like me to adjust seat heating or seat position?",
+    "warm seat": "Should I turn on seat heating?",
+    "heat seat": "Should I activate seat heating?",
+    "steering": "Would you like steering wheel heating turned on?",
+    "wheel warmth": "Should I turn on steering wheel heating?",
+    "cold hands": "Should I turn on steering wheel heating?",
+    "warm hands": "Should I turn on steering wheel heating?",
+    "hand warmth": "Should I activate steering wheel heating?",
+    
+    # ════ WINDOWS/DOORS ════
+    "window": "Should I open or close the windows?",
+    "windows": "Should I open or close the windows?",
+    "open": "Should I open the windows?",
+    "close": "Should I close the windows?",
+    "sunroof": "Would you like the sunroof opened?",
+    "roof": "Should I open the sunroof?",
+    
+    # ════ GENERIC COMFORT ════
+    "please": "What adjustment would help?",
+    "thanks": "Anything else I can adjust?",
+    "ok": "Anything else I can help with?",
+    "good": "Anything else you'd like me to adjust?",
+    "need": "What do you need adjusted?",
+    "want": "What would you like me to do?",
+    "can you": "What would you like me to adjust?",
+    "i'd like": "Tell me what you'd like adjusted.",
+}
 
 # ── Retry/timeout bounds for every LLM call in this agent ─────────────────────
 # Without this, a single transient provider error (e.g. Gemini 503 "high
@@ -477,6 +693,8 @@ class CARBenchAgentExecutor(AgentExecutor):
         # category. Capped to keep prompt growth bounded.
         self._reflection_log: list[str] = []
         self._REFLECTION_LOG_MAX = 5
+        # Clarification cache for deterministic Pass³ answers
+        self.ctx_id_to_clarification_cache: dict[str, dict[str, str]] = {}  # ctx_id → {query_hash → clarification}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         inbound_message = context.message
@@ -514,7 +732,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                                 )
                             messages.append({
                                 "role": "system",
-                                "content": system_prompt + FORMAT_REMINDER + reflection_block,
+                                "content": system_prompt + FORMAT_REMINDER + DISAMBIGUATION_PROMPT + reflection_block,
                             })
                     else:
                         # Regular user message
@@ -1040,6 +1258,9 @@ class CARBenchAgentExecutor(AgentExecutor):
             del self.ctx_id_to_judged_tools[context.context_id]
         if context.context_id in self.ctx_id_to_verifier_checked:
             del self.ctx_id_to_verifier_checked[context.context_id]
+        # ADDING THIS LINE:
+        if context.context_id in self.ctx_id_to_clarification_cache:
+            del self.ctx_id_to_clarification_cache[context.context_id]
 
     # ── Policy layer helper methods ───────────────────────────────────────────
 
@@ -1102,6 +1323,130 @@ class CARBenchAgentExecutor(AgentExecutor):
         # None were clearly non-empty -- fall back to the first candidate we
         # got (even if empty), or None if every attempt raised.
         return candidates[0] if candidates else None
+
+    def _get_cached_clarification(self, ctx_id: str, vague_request: str) -> str | None:
+        """
+        Check if we have a cached clarification for this vague request.
+        Uses keyword matching for deterministic Pass³ consistency.
+        
+        Returns the cached clarification if found, else None.
+        
+        Strategy:
+        1. Check per-context cache (already asked this in this conversation)
+        2. Try exact keyword match
+        3. Try fuzzy keyword match (longest matching keyword)
+        4. Return None if no match (will use EVPI)
+        """
+        request_lower = vague_request.lower().strip()
+        
+        # Initialize per-context cache if needed
+        if ctx_id not in self.ctx_id_to_clarification_cache:
+            self.ctx_id_to_clarification_cache[ctx_id] = {}
+        
+        ctx_cache = self.ctx_id_to_clarification_cache[ctx_id]
+        
+        # Create a cache key from the request
+        cache_key = hashlib.md5(request_lower.encode()).hexdigest()
+        
+        # STRATEGY 1: If we've already clarified this exact request this conversation, reuse it
+        # This ensures Pass³ — same input = identical output every time
+        if cache_key in ctx_cache:
+            return ctx_cache[cache_key]
+        
+        # STRATEGY 2: Try exact match first (e.g., user says "cold" exactly)
+        for keyword, clarification in CLARIFICATION_CACHE.items():
+            if keyword == request_lower or request_lower == keyword:
+                ctx_cache[cache_key] = clarification
+                return clarification
+        
+        # STRATEGY 3: Try single-word keyword match
+        words = request_lower.split()
+        for word in words:
+            if word in CLARIFICATION_CACHE:
+                cached = CLARIFICATION_CACHE[word]
+                ctx_cache[cache_key] = cached
+                return cached
+        
+        # STRATEGY 4: Try phrase keyword match (longest first for accuracy)
+        best_match = None
+        best_match_len = 0
+        for keyword, clarification in CLARIFICATION_CACHE.items():
+            # Check if keyword appears in the request
+            if keyword in request_lower and len(keyword) > best_match_len:
+                best_match = clarification
+                best_match_len = len(keyword)
+        
+        if best_match:
+            ctx_cache[cache_key] = best_match
+            return best_match
+        
+        # No match found - will fall back to EVPI
+        return None
+    
+    def _filter_tools_for_disambiguation(self, user_request: str, all_tools: list[dict]) -> list[dict]:
+        """
+        Filter tools to only those relevant to disambiguation context.
+        Reduces hallucination risk by removing irrelevant tools.
+        
+        Returns filtered tool list if disambiguation detected, else all_tools.
+        """
+        request_lower = user_request.lower()
+        
+        # Map vague keywords to relevant tool patterns
+        keyword_to_tools = {
+            # Temperature/Climate
+            ("cold", "warm", "hot", "cool", "temperature", "heat"): {
+                "set_climate_temperature", "set_seat_heating", 
+                "set_steering_wheel_heating", "open_close_window"
+            },
+            # Visibility
+            ("see", "dark", "foggy", "fog", "visibility", "defrost"): {
+                "set_head_lights_low_beams", "set_head_lights_high_beams",
+                "set_window_defrost", "set_ambient_lights"
+            },
+            # Air Quality
+            ("air", "stale", "smell", "stuffy", "ventilation", "circulation"): {
+                "open_close_window", "set_air_circulation", "set_air_conditioning"
+            },
+            # Noise
+            ("loud", "noise", "quiet", "sound"): {
+                "open_close_window", "set_fan_speed"
+            },
+            # Lighting
+            ("light", "bright", "dim", "lighting", "ambient"): {
+                "set_ambient_lights", "set_head_lights_low_beams",
+                "set_head_lights_high_beams"
+            },
+            # Seat/Steering
+            ("seat", "steering", "wheel"): {
+                "set_seat_heating", "set_steering_wheel_heating"
+            },
+        }
+        
+        relevant_tool_names = set()
+        
+        # Find matching keywords
+        for keywords, tools in keyword_to_tools.items():
+            for keyword in keywords:
+                if keyword in request_lower:
+                    relevant_tool_names.update(tools)
+        
+        # If no keywords matched, return all tools (not a disambiguation case)
+        if not relevant_tool_names:
+            return all_tools
+        
+        # Filter tools to only relevant ones
+        filtered = [
+            t for t in all_tools 
+            if t["function"]["name"] in relevant_tool_names
+        ]
+        
+        # Always include utility tools
+        all_tool_names = {t["function"]["name"] for t in all_tools}
+        if not filtered and all_tools:
+            return all_tools  # Fallback to all if filtering removed everything
+        
+        return filtered if filtered else all_tools
 
     # Keywords that indicate the user named a specific car system → not tool-level ambiguous
     _SPECIFIC_CAR_TERMS = {
@@ -1195,7 +1540,13 @@ class CARBenchAgentExecutor(AgentExecutor):
         if self.model.startswith("ollama/"):
             completion_kwargs["num_ctx"] = 16384
 
+        # if self.temperature is not None:
+        #     completion_kwargs["temperature"] = self.temperature
+
+        # For Check D (disambiguation), always use temperature=0.0 for consistency
+        # This ensures Pass³ — same vague input = identical clarification every time
         if self.temperature is not None:
+            # Note: Check D bypasses this and forces 0.0 itself
             completion_kwargs["temperature"] = self.temperature
 
         # Configure reasoning effort / thinking
@@ -1421,7 +1772,7 @@ class CARBenchAgentExecutor(AgentExecutor):
 
         # Step 1: one call producing interpretations + candidate questions +
         # each candidate's predicted yes/no answer per interpretation.
-        kwargs["temperature"] = 0.7
+        kwargs["temperature"] = 0.0  # Deterministic for Pass³ consistency
         combined_prompt = (
             f'The car driver said: "{user_request}"\n'
             "1. List 3-4 distinct possible interpretations of what they might want. "
@@ -1731,6 +2082,11 @@ class CARBenchAgentExecutor(AgentExecutor):
         #   D1 — Params missing → ask one targeted question about the missing param(s).
         #   D2 — All params present but message is vague (short + no specific car system named)
         #        → run EVPI to detect tool-level ambiguity and ask the best question.
+        # ── Check D: Disambiguation ───────────────────────────────────────────
+        # Two-stage check:
+        #   D1 — Params missing → ask one targeted question about the missing param(s).
+        #   D2 — All params present but message is vague (short + no specific car system named)
+        #        → check cache FIRST (deterministic), then EVPI if not cached.
         if len(tool_calls) == 1:
             tc = tool_calls[0]
             tc_name_d = tc["function"]["name"]
@@ -1760,9 +2116,32 @@ class CARBenchAgentExecutor(AgentExecutor):
                 last_asst_content = asst_msgs[-1].get("content", "") if asst_msgs else ""
                 is_followup_answer = bool(last_asst_content and last_asst_content.strip().endswith("?"))
                 if last_user_msg and not is_followup_answer and self._is_vague_request(last_user_msg):
-                    ctx_logger.info("Policy[D2]: vague request, running EVPI", tool=tc_name_d, msg=last_user_msg[:60])
+                    ctx_logger.info("Policy[D2]: vague request, checking cache", tool=tc_name_d, msg=last_user_msg[:60])
+                    
+                    # D2a: Check clarification cache FIRST (deterministic for Pass³)
+                    cached_clarification = self._get_cached_clarification(context.context_id, last_user_msg)
+                    if cached_clarification:
+                        ctx_logger.info(
+                            "Policy[D2a]: using cached clarification", 
+                            tool=tc_name_d,
+                            user_msg=last_user_msg[:50],
+                            clarification=cached_clarification[:80]
+                        )
+                        return {"type": "replace_with_text_literal", "text": cached_clarification}
+                    
+                    # D2b: Not cached, run EVPI and cache the result
+                    ctx_logger.info("Policy[D2b]: running EVPI", tool=tc_name_d, msg=last_user_msg[:60])
                     evpi_resp = self._generate_evpi_clarification(last_user_msg, messages, completion_kwargs)
                     if evpi_resp is not None:
+                        # Extract the text from EVPI response
+                        evpi_text = evpi_resp.choices[0].message.content if hasattr(evpi_resp, 'choices') else str(evpi_resp)
+                        
+                        # Cache it for this conversation
+                        cache_key = hashlib.md5(last_user_msg.lower().strip().encode()).hexdigest()
+                        if context.context_id not in self.ctx_id_to_clarification_cache:
+                            self.ctx_id_to_clarification_cache[context.context_id] = {}
+                        self.ctx_id_to_clarification_cache[context.context_id][cache_key] = evpi_text
+                        
                         return {"type": "replace_with_text", "response": evpi_resp}
 
         return None  # all checks passed

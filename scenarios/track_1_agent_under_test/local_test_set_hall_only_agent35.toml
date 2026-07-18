@@ -1,0 +1,28 @@
+# Comparison scenario: same hallucination-only split, same judge model
+# (gemini-2.5-flash, unchanged) -- only the agent-under-test's own model is
+# swapped to gemini-3.5-flash, to isolate whether the newer model performs
+# meaningfully better under your existing, unchanged policy layer.
+#
+# VERTEXAI_LOCATION is overridden to "global" just for this agent process --
+# Gemini 3.5 Flash's own Model Garden page shows its sample requests using
+# locations/global, not a regional endpoint like us-central1, which is the
+# likely cause of the earlier 404 (this override does not touch your main
+# .env or affect any other scenario).
+
+[evaluator]
+endpoint = "http://127.0.0.1:8081"
+cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
+
+[agent_under_test]
+endpoint = "http://127.0.0.1:8080"
+cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm vertex_ai/gemini-3.5-flash"
+
+[config]
+num_trials = 1
+task_split = "test"
+tasks_hallucination_num_tasks = -1
+max_steps = 50
+user_model = "vertex_ai/gemini-2.5-flash"
+user_provider = "vertex_ai"
+policy_evaluator_model = "vertex_ai/gemini-2.5-flash"
+policy_evaluator_provider = "vertex_ai"

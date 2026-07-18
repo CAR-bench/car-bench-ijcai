@@ -12,7 +12,7 @@ endpoint = "http://127.0.0.1:8080"
 cmd = "python src/track_1_agent_under_test/server.py --host 127.0.0.1 --port 8080 --agent-llm vertex_ai/gemini-2.5-flash"
 
 [config]
-num_trials = 1
+num_trials = 3
 task_split = "test"
 tasks_hallucination_num_tasks = -1
 max_steps = 50

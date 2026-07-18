@@ -105,6 +105,27 @@ easy to miss):
   a way to control the sunshade right now — only the sunroof. Want me to
   adjust the sunroof instead?"
 
+  A tool call can also succeed while a specific piece of data inside its
+  result comes back unknown or missing. Never state a specific value, or
+  claim a change was confirmed, for a field you never actually received.
+
+  Example: User: "Are my rear windows fully open?" (get_vehicle_window_positions
+  ran, but its result came back unknown for the rear window fields specifically).
+  Don't do this: state a percentage or confirm the rear windows are at any
+  position, since that data was never actually returned. Do this: "I got some
+  window info back, but the rear window positions came back unknown right
+  now — I can't confirm their exact state."
+
+  When a needed value is missing this way, do not ask the user to manually
+  supply it so you can proceed anyway — that is routing around the missing
+  capability, not acknowledging it. State plainly that you can't check it.
+
+  Example: User: "How long will it take to charge to full?" (get_charging_specs_and_status
+  ran, but battery_capacity_kwh and state_of_charge both came back unknown).
+  Don't do this: ask the user to tell you their current charge level so you
+  can calculate it anyway. Do this: "I'm not able to check your battery's
+  current charge or capacity right now, so I can't calculate charging time."
+
   Example: User: "Set the ambient lighting to a warm orange color." (the
   set_ambient_lights tool only accepts RED, BLUE, GREEN, CYAN, or OFF). Don't
   do this: call set_ambient_lights with color=ORANGE anyway, or silently
@@ -406,6 +427,25 @@ POLICY_VERIFIER_RULES: list[dict] = [
 
 # Matches "2 PM", "1:30pm", "11:00 A.M." etc. for deterministic 24h conversion.
 _TIME_12H_PATTERN = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([AaPp])\.?[Mm]\.?\b")
+
+# JSON Schema keywords not supported by Vertex's Gemini function-calling
+# Schema proto -- must be stripped before sending tools to a fine-tuned
+# endpoint, since LiteLLM's normal OpenAI->Gemini conversion (which already
+# strips these) never runs for a bare numeric model id.
+_UNSUPPORTED_SCHEMA_KEYS = {"additionalProperties", "multipleOf", "exclusiveMinimum", "exclusiveMaximum", "const", "$schema", "title", "examples"}
+
+
+def _strip_unsupported_schema_keys(obj):
+    """Recursively remove JSON Schema keys Vertex's function-calling Schema proto doesn't accept."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_unsupported_schema_keys(v)
+            for k, v in obj.items()
+            if k not in _UNSUPPORTED_SCHEMA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_unsupported_schema_keys(v) for v in obj]
+    return obj
 
 
 class CARBenchAgentExecutor(AgentExecutor):
@@ -818,8 +858,26 @@ class CARBenchAgentExecutor(AgentExecutor):
                 if verifier_hint:
                     # Keep tools enabled — if a real action needs to happen, the
                     # redo should be able to call it, not just rephrase the text.
+                    # Sample twice (self-consistency): the flagged issue is
+                    # usually "claimed action with no backing tool call", so a
+                    # candidate that actually emits a tool call is the more
+                    # trustworthy fix than one that just rephrases the text —
+                    # a single redo can land on either by chance from trial to
+                    # trial, which is exactly what hurts Pass^3 without hurting
+                    # Pass@1.
                     redo_messages = messages + [{"role": "user", "content": f"[AGENT CONTEXT: {verifier_hint}]"}]
-                    redo_resp = completion(messages=redo_messages, **completion_kwargs)
+                    redo_candidates = []
+                    for _ in range(2):
+                        try:
+                            redo_candidates.append(completion(messages=redo_messages, **completion_kwargs))
+                        except Exception:
+                            continue
+                    redo_resp = next(
+                        (r for r in redo_candidates if r.choices[0].message.model_dump(exclude_unset=True).get("tool_calls")),
+                        redo_candidates[0] if redo_candidates else None,
+                    )
+                    if redo_resp is None:
+                        redo_resp = completion(messages=redo_messages, **completion_kwargs)
                     assistant_content = redo_resp.choices[0].message.model_dump(exclude_unset=True)
                     tool_calls = assistant_content.get("tool_calls")
                     if tool_calls:
@@ -1023,6 +1081,28 @@ class CARBenchAgentExecutor(AgentExecutor):
         kwargs = {k: v for k, v in completion_kwargs.items() if k != "tools"}
         return completion(messages=temp_messages, **kwargs)
 
+    def _generate_clarification_consistent(self, messages: list[dict], hint: str, completion_kwargs: dict, n: int = 2):
+        """Self-consistency variant of _generate_clarification: sample n
+        independent redo attempts instead of trusting a single one, and pick
+        the first non-empty response. Targets Pass^3 (trial-to-trial
+        consistency) rather than Pass@1 -- a single redo can happen to land
+        on an empty/weak response by chance on one trial and a good one on
+        another for the exact same flagged issue; sampling reduces that
+        variance without needing a new judging mechanism."""
+        candidates = []
+        for _ in range(n):
+            try:
+                resp = self._generate_clarification(messages, hint, completion_kwargs)
+                candidates.append(resp)
+                content = getattr(resp.choices[0].message, "content", None)
+                if content and content.strip():
+                    return resp
+            except Exception:
+                continue
+        # None were clearly non-empty -- fall back to the first candidate we
+        # got (even if empty), or None if every attempt raised.
+        return candidates[0] if candidates else None
+
     # Keywords that indicate the user named a specific car system → not tool-level ambiguous
     _SPECIFIC_CAR_TERMS = {
         "temperature", "temp", "fan", "speed", "ac", "air conditioning", "heat", "cool",
@@ -1084,6 +1164,32 @@ class CARBenchAgentExecutor(AgentExecutor):
             "num_retries": LLM_NUM_RETRIES,
             "timeout": LLM_TIMEOUT_SECONDS,
         }
+
+        # A Vertex AI fine-tuned endpoint is referenced by a bare numeric ID
+        # (e.g. "vertex_ai/1947235642547109888"). LiteLLM only recognizes
+        # this as a Gemini-family model (routing to generateContent) if
+        # base_model is given explicitly -- otherwise it defaults to the
+        # legacy non-Gemini Predict/RawPredict path, which fails outright
+        # for a tuned Gemini model with a 400 error.
+        model_id_part = self.model.split("/")[-1]
+        if model_id_part.isdigit():
+            completion_kwargs["base_model"] = "vertex_ai/gemini-2.5-flash"
+            # LiteLLM's OpenAI-tools -> Gemini functionDeclarations conversion
+            # keys off the model string containing "gemini" -- a bare numeric
+            # endpoint ID never matches, so tools are otherwise passed through
+            # untranslated and Vertex rejects the raw OpenAI shape outright.
+            # Convert to Gemini's native tool schema ourselves before calling.
+            # Vertex's function-calling Schema proto only supports a subset of
+            # JSON Schema -- keys like "additionalProperties"/"multipleOf" are
+            # rejected outright. LiteLLM's own conversion path strips these,
+            # but that path never runs for a bare numeric model, so do it here.
+            if completion_kwargs["tools"]:
+                completion_kwargs["tools"] = [{
+                    "function_declarations": [
+                        _strip_unsupported_schema_keys(t["function"])
+                        for t in completion_kwargs["tools"]
+                    ]
+                }]
 
         # Ollama needs a larger context window to fit 57 tool schemas (~10K tokens)
         if self.model.startswith("ollama/"):
@@ -1583,7 +1689,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 self.ctx_id_to_judged_tools.setdefault(ctx_id, set()).add(tc_name)
                 verdict_hint = self._judge_generic_prereq(messages, tc_name, tc_args, ctx_logger)
                 if verdict_hint:
-                    return {"type": "replace_with_text", "response": self._generate_clarification(messages, verdict_hint, completion_kwargs)}
+                    return {"type": "replace_with_text", "response": self._generate_clarification_consistent(messages, verdict_hint, completion_kwargs)}
 
         # ── Check H: nav-edit tools must not run in parallel (TECH-AUT-POL:018) ──
         nav_edit_calls = [tc for tc in tool_calls if tc["function"]["name"] in NAVIGATION_EDIT_TOOLS]

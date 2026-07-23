@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 from uuid import uuid4
 
@@ -13,7 +12,6 @@ from a2a.types import (
     Message,
     Role,
     SendMessageRequest,
-    StreamResponse,
 )
 from a2a.helpers.proto_helpers import new_text_part
 from google.protobuf.json_format import MessageToDict

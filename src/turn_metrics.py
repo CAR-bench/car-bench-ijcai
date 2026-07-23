@@ -58,7 +58,9 @@ def extract_turn_metrics(metadata) -> dict:
                 if key in metrics_fields:
                     val = metrics_fields[key]
                     # Use WhichOneof to determine the actual value type
-                    kind = val.WhichOneof("kind") if hasattr(val, "WhichOneof") else None
+                    kind = (
+                        val.WhichOneof("kind") if hasattr(val, "WhichOneof") else None
+                    )
                     if kind == "number_value":
                         result[key] = val.number_value
                     elif kind == "string_value":

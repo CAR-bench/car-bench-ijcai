@@ -1,122 +1,160 @@
-# Track 2 Cerebras Agent Under Test
+# PACT Track 2 Agent
 
-This package is the direct Track 2 Cerebras Fast-Reasoning starter agent for
-CAR-bench A2A evaluation. It calls Cerebras-hosted `gpt-oss` models directly
-through the Cerebras Python SDK and returns the same benchmark-visible A2A text
-responses or tool calls as the Track 1 template.
+This is the final Track 2 runtime. PACT (Policy-Aware Contract-guided Tool-use)
+uses direct Cerebras inference through the Cerebras Python SDK, but does not
+execute model-proposed calls immediately. It compiles a request into a typed
+plan, verifies that plan against the live A2A tool contracts and policy
+obligations, and only then emits one externally visible action.
 
-The default executor model is `gpt-oss-120b` with
-`TRACK2_EXECUTOR_REASONING_EFFORT=medium`. Participants should use a
-Cerebras-hosted `gpt-oss` executor model, while replacing prompting,
-validation, or harnessing strategy as long as the external A2A contract stays
-unchanged.
+## Runtime Contract
 
-## What This Agent Demonstrates
+- The A2A server entry point is `server.py`; it instantiates
+  `PACTAgentExecutor`, not the legacy direct executor.
+- State, evidence, pending actions, and metrics are isolated by `context_id`.
+- Tool capabilities are taken only from the current evaluator message. An
+  explicit empty tool list revokes the previous capability snapshot.
+- At most one tool call is outstanding. Results are correlated with the
+  pending operation and argument/schema fingerprints before they become
+  evidence.
+- Consequential actions require the plan's confirmation obligations to be
+  satisfied. Completion claims require successful external evidence.
+- Every final A2A text response reports aggregate `turn_metrics`, including
+  `prompt_tokens`, `completion_tokens`, and `thinking_tokens`.
+- Each compilation uses one proposal and at most one verification-guided
+  repair. A locally valid plan containing an action receives one independent
+  full-policy and argument-provenance audit. The worst case is three sequential
+  completions, below Track 2's five-call limit; answer/refusal-only plans skip
+  the audit.
+- Exact confirmations and successful actions advance the already-verified
+  immutable suffix without another model call. Ask answers, observations, and
+  revised confirmations are replan boundaries. A capability change detected
+  while releasing a confirmation triggers a fresh compile; one detected at
+  external-call emission rejects the call and fails closed.
 
-- Parses evaluator messages into policy/user text, tool definitions, and tool
-  results.
-- Maintains conversation history per `context_id`.
-- Calls the Cerebras SDK `chat.completions.with_raw_response.create(...)`.
-- Uses Cerebras structured JSON schema output for a strict next-action object.
-- Logs successful-response `x-ratelimit-*` headers for visibility.
-- Writes JSON rate-limit reports for Cerebras 429s, including provider headers
-  and error body.
+Provider output uses a compact Cerebras strict JSON schema. The richer plan is
+decoded and checked locally, so malformed or unverifiable output fails closed
+instead of being forwarded to the evaluator.
 
 ## Configuration
 
-Set the evaluator key and Cerebras key in `.env`:
+Put development secrets in an untracked `.env` file. Do not add them to source,
+Docker build arguments, image layers, or a submitted scenario TOML.
 
 ```bash
 GEMINI_API_KEY=...
 CEREBRAS_API_KEY=...
-TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-TRACK2_EXECUTOR_REASONING_EFFORT=medium
+PACT_COMPILER_MODEL=gpt-oss-120b
+PACT_COMPILER_CEREBRAS_API_BASE=https://api.cerebras.ai
+PACT_COMPILER_REASONING_EFFORT=medium
+PACT_COMPILER_MAX_COMPLETION_TOKENS=8192
+PACT_COMPILER_SEMANTIC_REVIEW=true
 ```
 
-Important environment variables:
+The final submission template exposes the following runtime settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CEREBRAS_API_KEY` | required | Cerebras API key used by the SDK. |
-| `TRACK2_EXECUTOR_MODEL` | `gpt-oss-120b` | Cerebras-hosted `gpt-oss` executor model. Old `cerebras/...` prefixes are accepted and stripped for compatibility. |
-| `TRACK2_EXECUTOR_REASONING_EFFORT` | `medium` | Cerebras `gpt-oss` reasoning effort for executor calls. Supported values are `low`, `medium`, and `high`. |
-| `TRACK2_CEREBRAS_SERVICE_TIER` | unset | Optional Cerebras service tier, for example `default`, `priority`, `auto`, or `flex`. |
-| `TRACK2_MAX_COMPLETION_TOKENS` | `1024` | Completion-token cap for executor calls. |
-| `TRACK2_TEMPERATURE` | unset | Optional executor temperature. Leave unset to use the provider default. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_SECONDS` | `60` | Nominal first local pause after a provider `queue_exceeded` 429. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO` | `0.1` | First queue retry jitter ratio; default gives roughly 54-66 seconds. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MIN_SECONDS` | `90` | Minimum second queue retry wait. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS` | `120` | Maximum second queue retry wait. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS` | `180` | Minimum third-and-later queue retry wait. |
-| `TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS` | `300` | Maximum third-and-later queue retry wait. |
-| `TRACK2_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS` | `1` | Safety buffer added to provider reset or retry headers before retrying a 429. |
-| `CAR_BENCH_CEREBRAS_RATE_LIMIT_REPORT_DIR` | `/tmp/car-bench-rate-limit-reports` | Directory for Cerebras rate-limit JSON reports. Falls back to `CAR_BENCH_RATE_LIMIT_REPORT_DIR` when set. |
-| `TRACK2_LLM_MALFORMED_RETRIES` | `1` | Retry budget for malformed next-action JSON. |
+| `CEREBRAS_API_KEY` | required | Cerebras API key expected by the direct Cerebras SDK. |
+| `PACT_COMPILER_MODEL` | `gpt-oss-120b` | Cerebras-hosted compiler model. A legacy `cerebras/` prefix is normalized by the client. |
+| `PACT_COMPILER_CEREBRAS_API_BASE` | `https://api.cerebras.ai` | Configurable provider/API route. |
+| `PACT_COMPILER_SERVICE_TIER` | unset | Optional Cerebras service tier. |
+| `PACT_COMPILER_REASONING_EFFORT` | `medium` | `low`, `medium`, or `high`; the submitted setting gives the policy/argument audit a moderate reasoning budget. |
+| `PACT_COMPILER_MAX_COMPLETION_TOKENS` | `8192` | Per compiler-call completion-token cap, including provider reasoning tokens. |
+| `PACT_COMPILER_SEMANTIC_REVIEW` | `true` | Run one independently prompted, locally reverified audit for action-bearing plans. |
+| `PACT_COMPILER_TEMPERATURE` | unset | Optional sampling temperature in `[0, 2]`; unset uses the provider default. |
+| `PACT_COMPILER_MAX_REPAIR_ATTEMPTS` | `1` | Local verification repair budget; only `0` or `1` is accepted. |
+| `PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES` | `3` | Maximum number of provider rate-limit retries per compiler call. |
+| `PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS` | `600` | Cumulative provider rate-limit wait budget per compiler call. |
+| `LOGURU_LEVEL` | `INFO` | Runtime log level. |
 
-## Rate Limits And Development Windows
+The local verifier limits are also configurable as
+`PACT_COMPILER_MAX_NODES`, `PACT_COMPILER_MAX_DEPENDENCY_DEPTH`,
+`PACT_COMPILER_MAX_POLICY_CHARS`, `PACT_COMPILER_MAX_GOAL_CHARS`,
+`PACT_COMPILER_MAX_USER_EVENT_CHARS`,
+`PACT_COMPILER_MAX_CONVERSATION_MESSAGES`,
+`PACT_COMPILER_MAX_CONVERSATION_CHARS`, `PACT_COMPILER_MAX_CONTEXT_CHARS`,
+`PACT_COMPILER_MAX_CANDIDATE_CHARS`, and
+`PACT_COMPILER_MAX_EVIDENCE_RECORDS`. Their defaults are defined and validated
+in `plan_compiler_backend.py`.
 
-During normal development, participants are expected to use the Cerebras public
-tier, where rate limits can be strict. Use smaller smoke scenarios first, keep
-`TRACK2_MAX_COMPLETION_TOKENS` as low as the task allows, and schedule larger
-public-tier runs externally instead of launching many jobs at once.
+PACT intentionally ignores archived `TRACK2_PLANNER_*`, `TRACK2_EXECUTOR_*`,
+and `TRACK2_CEREBRAS_*` variables. This prevents a stale V1 environment from
+silently changing the submitted compiler model, reasoning effort, or budgets.
 
-The reference client does not proactively throttle based on local request/token
-limits or previous successful responses. It sends the request and only waits
-reactively after a provider-visible Cerebras 429.
-The reference client records successful provider-call timings and keeps failed
-429 attempts in logs/reports.
+## Local Validation
 
-When a Cerebras 429 is observed, the client writes a JSON report by default to
-`/tmp/car-bench-rate-limit-reports`. The report includes session start time,
-wall time until the limit, wall time since the previous limit/retry marker,
-successful-call token usage, estimated attempted request tokens, the current
-failed call shape, and the raw provider payload. A provider
-`queue_exceeded` error respects `retry-after` if Cerebras sends one; otherwise
-it applies jittered local backoff: roughly 60 seconds on the first queue retry,
-90-120 seconds on the second, and 180-300 seconds on later queue retries. A
-quota error with `x-ratelimit-reset-tokens-minute` applies that reset hint plus
-the configured buffer before retrying. If Cerebras omits that token-reset
-header, the client logs the missing header and falls back to
-`x-ratelimit-reset-requests-day` or `retry-after` when present.
-Final time-budget and quota-wait accounting details will be announced before
-the official evaluation.
-
-Terminal logs show the attempted request estimate, previous successful
-rate-limit headers when available, and on 429 the wait duration, resume time,
-wait reason, source header, reset-header values, and any expected reset header
-that Cerebras did not provide.
-
-Organizers will provide a few test windows with elevated rate limits and
-priority tier access so participants can test harness behavior at higher speed
-and with less throttling. Participants may also self-host the open-source models
-used by the Cerebras `gpt-oss` executor during development, then validate
-speed-sensitive behavior during those windows.
-
-Codex Pro plans are still provided for selected Track 2 teams to accelerate
-harness engineering and development. They are not the submitted-agent runtime
-for this template. Plans are allocated by June 15.
-
-## Run
-
-Local smoke:
+Install the Track 2 and evaluator dependencies, then run the smallest public
+scenario first:
 
 ```bash
+uv sync --frozen --extra track-2-agent --extra car-bench-evaluator
 uv run car-bench-run scenarios/track_2_agent_under_test_cerebras/local_smoke.toml --show-logs
 ```
 
-Docker smoke:
+Validate the local release image with the official evaluator image:
 
 ```bash
-uv run python generate_compose.py --scenario scenarios/track_2_agent_under_test_cerebras/local_docker_smoke.toml
-docker compose --env-file .env -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml up --abort-on-container-exit
+uv run python generate_compose.py \
+  --scenario scenarios/track_2_agent_under_test_cerebras/local_docker_smoke.toml
+docker compose --env-file .env \
+  -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml \
+  up --abort-on-container-exit --exit-code-from a2a-client
 ```
+
+## Option C: GHCR Image Validation
+
+Build and publish the exact `linux/amd64` release candidate. The repository's
+manual `Publish Track 2 Release Candidate to GHCR` workflow is preferred because
+its summary records the immutable digest. For a manual build:
+
+```bash
+PACT_IMAGE=ghcr.io/puyanguvic/car-bench-track-2-direct
+PACT_TAG=track2-pact-rc
+docker buildx build --platform linux/amd64 \
+  --provenance=false \
+  -f src/track_2_agent_under_test_cerebras/Dockerfile.track-2-agent-under-test-cerebras \
+  -t "${PACT_IMAGE}:${PACT_TAG}" --push .
+docker buildx imagetools inspect "${PACT_IMAGE}:${PACT_TAG}"
+```
+
+Set the GHCR package visibility to **Public**. Copy the digest reported by the
+push or workflow; do not submit the mutable tag. Put that exact digest-pinned
+image and the `PACT_*` environment block from
+`submission/track_2_direct/scenario.toml.template` into
+`scenarios/track_2_agent_under_test_cerebras/ghcr_smoke.toml`, then run:
+
+```bash
+uv run python generate_compose.py \
+  --scenario scenarios/track_2_agent_under_test_cerebras/ghcr_smoke.toml
+docker compose --env-file .env \
+  -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml \
+  up --abort-on-container-exit --exit-code-from a2a-client
+```
+
+This is the README option C required by the submission checklist: it exercises
+the public, digest-pinned image rather than a local build. Retain the command
+output as validation evidence.
+
+## Final Scenario
+
+After Option C succeeds, render the hidden-set scenario with the same digest:
+
+```bash
+uv run python scripts/prepare_track2_submission.py \
+  --variant direct \
+  --image-digest "${PACT_DIGEST}" \
+  --output dist/track2-direct/scenario.toml
+```
+
+`PACT_DIGEST` must be the actual `sha256:` digest from the published image. The
+renderer rejects mutable image tags, non-hidden test configuration, incorrect
+task counts, and literal environment values. Inspect the generated file before
+copy-pasting it into the organizer form; it must not contain a secret.
 
 ## Read More
 
-- [Main README](../../README.md): setup, validation modes, and submission shape.
-- [Development guide](../../docs/development-guide.md): detailed A2A turn
-  contract.
+- [Main README](../../README.md): official A2A workflow and validation modes.
+- [Submission package](../../submission/README.md): final release checklist.
+- [PACT design](../../docs/pact-v2-design.md): architecture and invariants.
 - [Harnessing guide](../../docs/agent-under-test-harnessing.md): allowed
-  harness boundaries.
-- [Track 2 harness patterns](../../docs/cerebras-harness-patterns.md): direct
-  Cerebras, planner/executor, and rate-limit development guidance.
+  evaluator boundary.

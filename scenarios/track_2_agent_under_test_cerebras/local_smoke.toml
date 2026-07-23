@@ -1,4 +1,4 @@
-# Local smoke scenario for the Track 2 Cerebras agent under test.
+# Local smoke scenario for the PACT Track 2 agent under test.
 # Runs one train task from each CAR-bench task type.
 
 [evaluator]

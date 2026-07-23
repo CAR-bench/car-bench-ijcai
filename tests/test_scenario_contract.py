@@ -1,3 +1,4 @@
+import stat
 import tempfile
 import tomllib
 import unittest
@@ -19,12 +20,14 @@ from generate_compose import (
     generate_a2a_scenario,
     generate_docker_compose,
     parse_scenario,
+    prepare_results_mount,
 )
 
 loguru_logger.disable("agentbeats.run_scenario")
 
 EXPECTED_SCENARIO_FILES = {
     "local_smoke.toml",
+    "local_public_batch.toml",
     "local_test_set.toml",
     "local_docker_smoke.toml",
     "local_docker_test_set.toml",
@@ -84,7 +87,11 @@ class ScenarioContractTest(unittest.TestCase):
                 }
                 self.assertEqual(files, EXPECTED_SCENARIO_FILES)
 
-                for name in ("local_smoke.toml", "local_docker_smoke.toml", "ghcr_smoke.toml"):
+                for name in (
+                    "local_smoke.toml",
+                    "local_docker_smoke.toml",
+                    "ghcr_smoke.toml",
+                ):
                     data = tomllib.loads((scenario_dir / name).read_text())
                     config = data["config"]
                     self.assertEqual(config["num_trials"], 1)
@@ -93,7 +100,21 @@ class ScenarioContractTest(unittest.TestCase):
                     self.assertEqual(config["tasks_hallucination_num_tasks"], 1)
                     self.assertEqual(config["tasks_disambiguation_num_tasks"], 1)
 
-                for name in ("local_test_set.toml", "local_docker_test_set.toml", "ghcr_test_set.toml"):
+                data = tomllib.loads(
+                    (scenario_dir / "local_public_batch.toml").read_text()
+                )
+                config = data["config"]
+                self.assertEqual(config["num_trials"], 1)
+                self.assertEqual(config["task_split"], "test")
+                self.assertEqual(config["tasks_base_num_tasks"], 10)
+                self.assertEqual(config["tasks_hallucination_num_tasks"], 10)
+                self.assertEqual(config["tasks_disambiguation_num_tasks"], 10)
+
+                for name in (
+                    "local_test_set.toml",
+                    "local_docker_test_set.toml",
+                    "ghcr_test_set.toml",
+                ):
                     data = tomllib.loads((scenario_dir / name).read_text())
                     config = data["config"]
                     self.assertEqual(config["num_trials"], 3)
@@ -103,13 +124,28 @@ class ScenarioContractTest(unittest.TestCase):
                     self.assertEqual(config["tasks_disambiguation_num_tasks"], -1)
 
     def test_compose_up_command_uses_root_env_file(self) -> None:
-        command = compose_up_command(Path("scenarios/track_1_agent_under_test/docker-compose.yml"))
+        command = compose_up_command(
+            Path("scenarios/track_1_agent_under_test/docker-compose.yml")
+        )
 
         self.assertEqual(
             command,
             "docker compose --env-file .env -f "
-            "scenarios/track_1_agent_under_test/docker-compose.yml up --abort-on-container-exit",
+            "scenarios/track_1_agent_under_test/docker-compose.yml up "
+            "--abort-on-container-exit --exit-code-from a2a-client",
         )
+
+    def test_results_mount_is_writable_by_an_arbitrary_container_uid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "output"
+            agent_dir = prepare_results_mount(root, "example agent")
+
+            self.assertEqual(agent_dir, root / "example-agent")
+            for directory in (root, agent_dir):
+                mode = directory.stat().st_mode
+                self.assertTrue(mode & stat.S_IWOTH)
+                self.assertTrue(mode & stat.S_IXOTH)
+                self.assertTrue(mode & stat.S_ISVTX)
 
     def test_generated_a2a_scenario_uses_singular_aut_contract(self) -> None:
         scenario = generate_a2a_scenario(self._scenario())
@@ -122,8 +158,8 @@ class ScenarioContractTest(unittest.TestCase):
 
     def test_timestamped_output_path_uses_agent_model_and_effort(self) -> None:
         data = {
-                "run": {
-                    "agent_name": "cerebras-planner",
+            "run": {
+                "agent_name": "cerebras-planner",
                 "scenario_name": "cerebras-planner/local_docker_smoke",
                 "agent_metadata": {
                     "TRACK2_PLANNER_MODEL": "gpt-oss-120b",
@@ -144,6 +180,23 @@ class ScenarioContractTest(unittest.TestCase):
         self.assertIn("high_to_medium", path.name)
         self.assertIn("split-unspecified", path.name)
 
+    def test_timestamped_output_path_recognizes_pact_metadata(self) -> None:
+        scenario = self._scenario()
+        scenario["agent_under_test"]["env"] = {
+            "PACT_COMPILER_MODEL": "${PACT_COMPILER_MODEL:-gpt-oss-120b}",
+            "PACT_COMPILER_REASONING_EFFORT": (
+                "${PACT_COMPILER_REASONING_EFFORT:-medium}"
+            ),
+        }
+        generated = generate_a2a_scenario(scenario)
+        data = tomllib.loads(generated)
+
+        path = resolve_output_path("output", Path("scenario.toml"), data)
+
+        self.assertIsNotNone(path)
+        self.assertIn("gpt-oss-120b", path.name)
+        self.assertIn("medium", path.name)
+
     def test_output_path_omits_unreliable_user_model(self) -> None:
         data = {
             "evaluator": {"endpoint": "http://127.0.0.1:8081"},
@@ -158,7 +211,9 @@ class ScenarioContractTest(unittest.TestCase):
             },
         }
 
-        path = resolve_output_path("output", Path("scenarios/custom/local_smoke.toml"), data)
+        path = resolve_output_path(
+            "output", Path("scenarios/custom/local_smoke.toml"), data
+        )
 
         self.assertIsNotNone(path)
         self.assertIn("test-trials1-base2-hall0-dis0", path.name)
@@ -205,7 +260,9 @@ class ScenarioContractTest(unittest.TestCase):
         self.assertEqual(payload["summary"], {"pass_rate": 50.0})
         self.assertEqual(payload["metadata"]["model"], "gemini/gemini-2.5-flash")
         self.assertEqual(payload["metadata"]["reasoning_effort"], "low")
-        self.assertEqual(payload["metadata"]["task_selection"], "split-unspecified-trials1")
+        self.assertEqual(
+            payload["metadata"]["task_selection"], "split-unspecified-trials1"
+        )
         self.assertEqual(payload["metadata"]["wall_time_seconds"], 60.0)
         self.assertEqual(payload["metadata"]["quota_wait_seconds"], 0.0)
 
@@ -219,7 +276,9 @@ class ScenarioContractTest(unittest.TestCase):
         payload = build_output_payload(
             req=req,
             evaluator_url=evaluator_url,
-            scenario_path=Path("scenarios/track_2_agent_under_test_cerebras/local_smoke.toml"),
+            scenario_path=Path(
+                "scenarios/track_2_agent_under_test_cerebras/local_smoke.toml"
+            ),
             scenario_data={
                 "agent_under_test": {
                     "endpoint": "http://127.0.0.1:8080",

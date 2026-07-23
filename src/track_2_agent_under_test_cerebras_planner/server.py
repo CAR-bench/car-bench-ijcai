@@ -103,6 +103,7 @@ def main() -> None:
     parser.add_argument("--card-url", type=str)
     parser.add_argument("--planner-model", type=str, default=None)
     parser.add_argument("--executor-model", type=str, default=None)
+    parser.add_argument("--api-base", type=str, default=None)
     parser.add_argument("--service-tier", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--planner-temperature", type=float, default=None)
@@ -136,6 +137,11 @@ def main() -> None:
         args.executor_model
         if args.executor_model is not None
         else _env_or_default("TRACK2_EXECUTOR_MODEL", DEFAULT_EXECUTOR_MODEL)
+    )
+    api_base = (
+        args.api_base
+        if args.api_base is not None
+        else _env_or_default("TRACK2_CEREBRAS_API_BASE", DEFAULT_CEREBRAS_API_BASE)
     )
     service_tier = (
         args.service_tier
@@ -189,11 +195,18 @@ def main() -> None:
         if args.malformed_retries is not None
         else _env_int("TRACK2_LLM_MALFORMED_RETRIES", 1)
     )
+    if not 0 <= malformed_retries <= 3:
+        parser.error(
+            "--malformed-retries / TRACK2_LLM_MALFORMED_RETRIES must be between "
+            "0 and 3 so planner/executor baseline steps never exceed five "
+            "sequential LLM calls."
+        )
 
     logger.info(
         "Starting CAR-bench agent (Cerebras planner/executor)",
         planner_model=planner_model,
         executor_model=executor_model,
+        api_base=api_base,
         service_tier=service_tier,
         planner_temperature=planner_temperature,
         executor_temperature=executor_temperature,
@@ -214,7 +227,7 @@ def main() -> None:
             executor_model=executor_model or DEFAULT_EXECUTOR_MODEL,
             planner_max_completion_tokens=planner_max_completion_tokens,
             executor_max_completion_tokens=executor_max_completion_tokens,
-            api_base=DEFAULT_CEREBRAS_API_BASE,
+            api_base=api_base,
             service_tier=service_tier,
             planner_temperature=planner_temperature,
             executor_temperature=executor_temperature,

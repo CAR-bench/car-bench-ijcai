@@ -31,7 +31,7 @@ The official competition has two tracks:
 | Track | Goal | Starter |
 | --- | --- | --- |
 | **Track 1: Open Track** | Use any model, provider, framework, or architecture to maximize reliability. The Best Innovation Award focuses on agent harnessing and reliability design. | [`src/track_1_agent_under_test/`](src/track_1_agent_under_test/) |
-| **Track 2: Cerebras Fast-Reasoning** | Use direct Cerebras-hosted `gpt-oss` inference and compute-aware harnessing to turn fast inference into better reliability under Track 2 inference-compute constraints. Track 2 registration is closed. | [`src/track_2_agent_under_test_cerebras/`](src/track_2_agent_under_test_cerebras/) and planner variant |
+| **Track 2: Cerebras Fast-Reasoning** | Use direct Cerebras-hosted `gpt-oss` inference and compute-aware harnessing to turn fast inference into better reliability under Track 2 inference-compute constraints. Track 2 registration is closed. | Final PACT agent in [`src/track_2_agent_under_test_cerebras/`](src/track_2_agent_under_test_cerebras/) |
 
 Final ranking is performed by the organizers on a hidden test set. The local
 `local_test_set.toml`, `local_docker_test_set.toml`, and `ghcr_test_set.toml`
@@ -140,10 +140,18 @@ The Track 1 starter is documented in
 ### Track 2 Setup
 
 Track 2 uses direct Cerebras `gpt-oss` inference through the Cerebras Python SDK.
-Participants should use Cerebras-hosted `gpt-oss` models. The direct executor
-defaults to `gpt-oss-120b` with `TRACK2_EXECUTOR_REASONING_EFFORT=medium`. The
-planner/executor template also defaults the private planner to `gpt-oss-120b`,
-with `TRACK2_PLANNER_REASONING_EFFORT=high` and executor effort `medium`.
+This submission has one production architecture: **PACT**, a contract-verified
+obligation planner. A Cerebras model is an untrusted semantic compiler; strict
+local decoding, typed PlanIR verification, a deterministic single-pending
+runtime, and an append-only evidence ledger retain execution authority. The
+reachable release path contains no task-ID branches, operation-specific
+allowlists, or domain workflows.
+
+> **Final submission source of truth:** use the PACT package, scenarios,
+> `PACT_*` environment variables, and commands in
+> [`src/track_2_agent_under_test_cerebras/README.md`](src/track_2_agent_under_test_cerebras/README.md).
+> Any direct-controller or planner/executor instructions that use `TRACK2_*`
+> names are **archived historical material**, not an alternative release path.
 
 ```bash
 uv sync --extra track-2-agent --extra car-bench-evaluator
@@ -154,27 +162,36 @@ Then add the evaluator and Cerebras keys to `.env`:
 ```bash
 GEMINI_API_KEY=...
 CEREBRAS_API_KEY=...
-TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-TRACK2_EXECUTOR_REASONING_EFFORT=medium
+PACT_COMPILER_CEREBRAS_API_BASE=https://api.cerebras.ai
+PACT_COMPILER_MODEL=gpt-oss-120b
+PACT_COMPILER_REASONING_EFFORT=medium
+PACT_COMPILER_MAX_COMPLETION_TOKENS=8192
+PACT_COMPILER_SEMANTIC_REVIEW=true
+PACT_COMPILER_MAX_REPAIR_ATTEMPTS=1
 ```
 
-For the planner/executor template, the default planner is also Cerebras
-`gpt-oss-120b`:
+The final defaults are `medium` reasoning, an 8,192-token completion ceiling,
+and semantic review enabled. A compilation uses one proposal, at most one local
+verification-guided repair, and, for an accepted plan containing an Act, one
+independent action-audit completion. The worst semantic path is therefore three
+sequential completions, below Track 2's limit of five. The audit result is
+strictly decoded and verified again; PACT never executes a rejected pre-audit
+candidate. Leave `PACT_COMPILER_TEMPERATURE` unset unless the provider should
+receive an explicit value.
 
-```bash
-TRACK2_PLANNER_MODEL=gpt-oss-120b
-TRACK2_PLANNER_REASONING_EFFORT=high
-TRACK2_PLANNER_MAX_COMPLETION_TOKENS=4096
-```
-
-Leave `TRACK2_PLANNER_TEMPERATURE` and `TRACK2_TEMPERATURE` unset unless the
-provider should receive an explicit temperature value.
+The older rule-controller executor and planner/executor variant remain in the
+source checkout as archived historical comparison code only. They are not
+copied into the final image, have no submission publish target, and their
+`TRACK2_EXECUTOR_*`, `TRACK2_PLANNER_*`, and `TRACK2_CEREBRAS_*` variables are
+intentionally ignored by PACT.
 
 Public Cerebras development-tier limits can be strict. Use smoke scenarios
-first and keep `TRACK2_MAX_COMPLETION_TOKENS` tight. The reference templates
-retry reactively only after a Cerebras 429, using
-`x-ratelimit-reset-tokens-minute` when Cerebras provides it and falling back to
-`retry-after` otherwise. Provider queue pressure uses jittered local backoff.
+first. The PACT client proactively waits when previous successful rate-limit
+headers show that the next estimated request would exceed the token-minute
+quota. It still retries
+reactively after a Cerebras 429, using `x-ratelimit-reset-tokens-minute` when
+Cerebras provides it and falling back to `retry-after` otherwise. Provider
+queue pressure uses jittered local backoff.
 Cerebras 429s write JSON reports to
 `/tmp/car-bench-rate-limit-reports` by default. Expect organizers to provide
 increased Cerebras rate limits compared with a free personal account; access
@@ -193,12 +210,20 @@ calls before the final response for that assistant step. Sequential-call
 compliance is documented through the technical-report architecture diagram, not
 through a new A2A metadata field.
 
-Track 2 details live in the agent READMEs:
+PACT makes the three token fields disjoint. Cerebras reasoning tokens are
+reported inside provider output tokens, so PACT reports visible completion as
+`max(0, output_tokens - reasoning_output_tokens)` and reports reasoning only as
+`thinking_tokens`. This prevents evaluator totals from double-counting
+reasoning. Exact confirmations and successful Acts advance an already verified
+suffix; Ask answers and observations are semantic data boundaries that trigger
+replanning.
 
-| Reference | README |
+Track 2 details live in the final agent README and design document:
+
+| Reference | Document |
 | --- | --- |
-| Direct Cerebras agent | [`src/track_2_agent_under_test_cerebras/README.md`](src/track_2_agent_under_test_cerebras/README.md) |
-| Planner/executor agent | [`src/track_2_agent_under_test_cerebras_planner/README.md`](src/track_2_agent_under_test_cerebras_planner/README.md) |
+| Final PACT agent | [`src/track_2_agent_under_test_cerebras/README.md`](src/track_2_agent_under_test_cerebras/README.md) |
+| Formal design and trust boundary | [`docs/pact-v2-design.md`](docs/pact-v2-design.md) |
 
 ---
 
@@ -233,8 +258,11 @@ For exact A2A shapes, protobuf helper usage, metadata, and code references, read
 | Agent | Package | Scenario Directory | Best For |
 | --- | --- | --- | --- |
 | Track 1 template | [`src/track_1_agent_under_test/`](src/track_1_agent_under_test/) | [`scenarios/track_1_agent_under_test/`](scenarios/track_1_agent_under_test/) | Building your own provider/model integration |
-| Track 2 Cerebras | [`src/track_2_agent_under_test_cerebras/`](src/track_2_agent_under_test_cerebras/) | [`scenarios/track_2_agent_under_test_cerebras/`](scenarios/track_2_agent_under_test_cerebras/) | Direct Cerebras next-action baseline |
-| Track 2 planner/executor | [`src/track_2_agent_under_test_cerebras_planner/`](src/track_2_agent_under_test_cerebras_planner/) | [`scenarios/track_2_agent_under_test_cerebras_planner/`](scenarios/track_2_agent_under_test_cerebras_planner/) | Cerebras `gpt-oss` planner with high reasoning plus Cerebras `gpt-oss` executor with medium reasoning |
+| Final Track 2 PACT | [`src/track_2_agent_under_test_cerebras/`](src/track_2_agent_under_test_cerebras/) | [`scenarios/track_2_agent_under_test_cerebras/`](scenarios/track_2_agent_under_test_cerebras/) | Submitted contract-verified obligation runtime with direct Cerebras inference |
+
+The source-only planner/executor directory is archived historical material, not
+a final reference agent or release option. Its `TRACK2_*` configuration must
+not be copied into a PACT scenario.
 
 ---
 
@@ -266,8 +294,7 @@ Fastest way to iterate on code. Agents run as local Python processes.
 | Track | Command |
 | --- | --- |
 | Track 1 | `uv run car-bench-run scenarios/track_1_agent_under_test/local_smoke.toml --show-logs` |
-| Track 2 Cerebras | `uv run car-bench-run scenarios/track_2_agent_under_test_cerebras/local_smoke.toml --show-logs` |
-| Track 2 planner/executor | `uv run car-bench-run scenarios/track_2_agent_under_test_cerebras_planner/local_smoke.toml --show-logs` |
+| Final Track 2 PACT | `uv run car-bench-run scenarios/track_2_agent_under_test_cerebras/local_smoke.toml --show-logs` |
 
 Use the corresponding `local_test_set.toml` only after the smoke scenario works.
 Local test-set runs are development validation, not official final evaluation.
@@ -281,11 +308,10 @@ is built from your local Dockerfile.
 
 | Track | Generate Compose | Run |
 | --- | --- | --- |
-| Track 1 | `uv run python generate_compose.py --scenario scenarios/track_1_agent_under_test/local_docker_smoke.toml` | `docker compose --env-file .env -f scenarios/track_1_agent_under_test/docker-compose.yml up --abort-on-container-exit` |
-| Track 2 Cerebras | `uv run python generate_compose.py --scenario scenarios/track_2_agent_under_test_cerebras/local_docker_smoke.toml` | `docker compose --env-file .env -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml up --abort-on-container-exit` |
+| Track 1 | `uv run python generate_compose.py --scenario scenarios/track_1_agent_under_test/local_docker_smoke.toml` | `docker compose --env-file .env -f scenarios/track_1_agent_under_test/docker-compose.yml up --abort-on-container-exit --exit-code-from a2a-client` |
+| Final Track 2 PACT | `uv run python generate_compose.py --scenario scenarios/track_2_agent_under_test_cerebras/local_docker_smoke.toml` | `docker compose --env-file .env -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml up --abort-on-container-exit --exit-code-from a2a-client` |
 
-For the Track 2 planner/executor agent, use the same commands
-with their scenario directories. `generate_compose.py` writes
+`generate_compose.py` writes
 `docker-compose.yml` and `a2a-scenario.toml` next to the selected Docker
 scenario; those generated files are ignored by git.
 
@@ -296,15 +322,32 @@ Participant agent images must be pullable by the organizers. For the public
 competition workflow, publish the GHCR package as **public** and do not bake API
 keys or other secrets into the image.
 
-Build and push an `linux/amd64` image:
+For the final PACT image, the repository's explicit workflow runs the release
+test suite and pushes one `linux/amd64` image manifest without an extra
+provenance platform descriptor:
 
 ```bash
-docker build --platform linux/amd64 \
-  -f src/track_1_agent_under_test/Dockerfile.track-1-agent-under-test \
-  -t ghcr.io/yourusername/your-agent:latest .
-
-docker push ghcr.io/yourusername/your-agent:latest
+gh workflow run publish-track2-ghcr.yml \
+  --repo puyanguvic/car-bench-ijcai \
+  --ref YOUR_RELEASE_BRANCH \
+  -f image_tag=track2-pact-final
 ```
+
+The equivalent manual build uses the selective PACT Dockerfile and pushes
+directly from Buildx:
+
+```bash
+docker buildx build --platform linux/amd64 --provenance=false --push \
+  -f src/track_2_agent_under_test_cerebras/Dockerfile.track-2-agent-under-test-cerebras \
+  -t ghcr.io/yourusername/car-bench-track-2-direct:track2-pact-final .
+```
+
+The `car-bench-track-2-direct` text is the retained GHCR package name, not a
+reference to the archived direct-controller architecture; this image is built
+from the PACT-only Dockerfile shown above.
+
+Record the registry-reported `sha256` digest. Do not use a mutable tag, a local
+image ID, or a digest copied from an earlier build in the submitted scenario.
 
 After the first push, open the package page and check **Package settings**:
 
@@ -318,24 +361,36 @@ For organization-owned images, use:
 https://github.com/orgs/your-org/packages/container/package/your-agent
 ```
 
-Set **Package visibility** to **Public**, or explicitly grant organizer access
-if the image must stay private. The `image = "..."`
-value in your `ghcr_*.toml` file must match the image you pushed.
+Set **Package visibility** to **Public**. Verify that the digest is anonymously
+pullable and that the registry manifest reports `linux/amd64`. The `image`
+value in `ghcr_smoke.toml`, `ghcr_test_set.toml`, and the submitted
+`scenario.toml` must use the same immutable form:
 
-Then update your `ghcr_smoke.toml` or `ghcr_test_set.toml` image reference and
-validate it:
-
-```bash
-uv run python generate_compose.py --scenario scenarios/track_1_agent_under_test/ghcr_smoke.toml
-docker compose --env-file .env -f scenarios/track_1_agent_under_test/docker-compose.yml up --abort-on-container-exit
+```text
+ghcr.io/yourusername/car-bench-track-2-direct@sha256:<registry-digest>
 ```
 
-For Track 2, use the matching Track 2 scenario directory and Dockerfile.
+Then run README option C against that exact public PACT digest and the official
+evaluator image:
 
-If you intentionally want CI publishing, this repo includes a disabled opt-in
-template at
-[`.github/workflows/publish-ghcr.yml.disabled`](.github/workflows/publish-ghcr.yml.disabled).
-It has no push/tag trigger; rename and configure it only if you want to use it.
+```bash
+uv run python generate_compose.py \
+  --scenario scenarios/track_2_agent_under_test_cerebras/ghcr_smoke.toml
+docker compose --env-file .env \
+  -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml pull
+docker compose --env-file .env \
+  -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml \
+  up --abort-on-container-exit --exit-code-from a2a-client
+docker compose --env-file .env \
+  -f scenarios/track_2_agent_under_test_cerebras/docker-compose.yml down
+```
+
+The release gate is complete only when the pulled digest is unchanged, the
+agent and evaluator become healthy, the client exits successfully, and the
+result artifact is writable. A task-level score is separate from this image and
+protocol validation. The disabled generic workflow remains starter material;
+the final PACT publish path is
+[`publish-track2-ghcr.yml`](.github/workflows/publish-track2-ghcr.yml).
 
 Results are written under `output/<agent-name>/` with filenames that include
 timestamp, scenario, task selection, trial count, and reliable model/reasoning
@@ -375,13 +430,20 @@ GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY}"
 LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
 
 [agent_under_test]
-image = "ghcr.io/your-org/your-agent@sha256:replace_with_digest"
+image = "ghcr.io/your-org/car-bench-track-2-direct@sha256:replace_with_registry_digest"
 
 [agent_under_test.env]
-AGENT_LLM = "${AGENT_LLM:?Set AGENT_LLM}"
-AGENT_API_BASE = "${AGENT_API_BASE:-}"
-AGENT_API_KEY = "${AGENT_API_KEY:?Set AGENT_API_KEY}"
-AGENT_TEMPERATURE = "${AGENT_TEMPERATURE:-}"
+CEREBRAS_API_KEY = "${CEREBRAS_API_KEY:?Set CEREBRAS_API_KEY}"
+PACT_COMPILER_MODEL = "${PACT_COMPILER_MODEL:-gpt-oss-120b}"
+PACT_COMPILER_CEREBRAS_API_BASE = "${PACT_COMPILER_CEREBRAS_API_BASE:-https://api.cerebras.ai}"
+PACT_COMPILER_SERVICE_TIER = "${PACT_COMPILER_SERVICE_TIER:-}"
+PACT_COMPILER_REASONING_EFFORT = "${PACT_COMPILER_REASONING_EFFORT:-medium}"
+PACT_COMPILER_MAX_COMPLETION_TOKENS = "${PACT_COMPILER_MAX_COMPLETION_TOKENS:-8192}"
+PACT_COMPILER_SEMANTIC_REVIEW = "${PACT_COMPILER_SEMANTIC_REVIEW:-true}"
+PACT_COMPILER_TEMPERATURE = "${PACT_COMPILER_TEMPERATURE:-}"
+PACT_COMPILER_MAX_REPAIR_ATTEMPTS = "${PACT_COMPILER_MAX_REPAIR_ATTEMPTS:-1}"
+PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES = "${PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES:-3}"
+PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS = "${PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS:-600}"
 LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
 
 [config]
@@ -452,9 +514,9 @@ src/
   agentbeats/                         inherited internal A2A runner helpers
   evaluator/                          CAR-bench evaluator A2A server
   track_1_agent_under_test/           Track 1 minimal template
-  track_2_agent_under_test_cerebras/  Track 2 direct Cerebras agent
+  track_2_agent_under_test_cerebras/  Final Track 2 PACT agent
   track_2_agent_under_test_cerebras_planner/
-                                      Track 2 planner/executor agent
+                                      Archived planner/executor history
   tool_call_types.py                  shared tool-call data models
   turn_metrics.py                     shared metadata keys
 
@@ -462,11 +524,12 @@ scenarios/
   track_1_agent_under_test/
   track_2_agent_under_test_cerebras/
   track_2_agent_under_test_cerebras_planner/
+                                      Archived historical scenarios; not release inputs
 
 docs/
   development-guide.md                detailed A2A turn contract
   agent-under-test-harnessing.md      allowed harness boundaries
-  cerebras-harness-patterns.md        Track 2 model/harness patterns
+  cerebras-harness-patterns.md        PACT harness plus clearly archived V1 history
 ```
 
 ---
@@ -477,11 +540,11 @@ Use this reading path when building your own agent:
 
 1. **Pick a starter**
    - Track 1: [`src/track_1_agent_under_test/README.md`](src/track_1_agent_under_test/README.md)
-   - Track 2 direct Cerebras: [`src/track_2_agent_under_test_cerebras/README.md`](src/track_2_agent_under_test_cerebras/README.md)
-   - Track 2 planner/executor: [`src/track_2_agent_under_test_cerebras_planner/README.md`](src/track_2_agent_under_test_cerebras_planner/README.md)
+   - Final Track 2 PACT: [`src/track_2_agent_under_test_cerebras/README.md`](src/track_2_agent_under_test_cerebras/README.md)
 2. **Understand the turn contract**
    - [`docs/development-guide.md`](docs/development-guide.md)
 3. **Design a more sophisticated harness**
+   - [`docs/pact-v2-design.md`](docs/pact-v2-design.md)
    - [`docs/agent-under-test-harnessing.md`](docs/agent-under-test-harnessing.md)
    - [`docs/cerebras-harness-patterns.md`](docs/cerebras-harness-patterns.md)
 4. **Protocol background**

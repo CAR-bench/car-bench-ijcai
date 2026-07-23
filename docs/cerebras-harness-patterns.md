@@ -1,141 +1,150 @@
-# Track 2 Cerebras Fast-Reasoning Harness Patterns
+# Track 2 PACT Cerebras Harness
 
-Track 2 agents use direct Cerebras-hosted `gpt-oss` inference through the
-Cerebras Python SDK or direct Cerebras API calls. The reference templates keep
-the public A2A boundary identical to Track 1 while giving participants a
-starting point for compute-aware harnesses. The Track 2 reference templates use
-Cerebras directly.
+The final Track 2 submission has one production architecture: **PACT**
+(Policy-Aware Contract-guided Tool-use). It uses direct Cerebras-hosted
+`gpt-oss` inference through the Cerebras Python SDK, while keeping all execution
+authority in a typed local verifier and deterministic obligation runtime. The
+canonical setup, validation, and submission instructions are in the
+[PACT agent README](../src/track_2_agent_under_test_cerebras/README.md).
 
-## Reference Agent Map
+> **Submission source of truth.** Use
+> [`src/track_2_agent_under_test_cerebras/`](../src/track_2_agent_under_test_cerebras/),
+> its PACT scenarios, and the `PACT_*` environment variables documented below.
+> The earlier direct next-action controller and planner/executor variant are
+> **archived historical implementations only**. They are not final submission
+> candidates, are not included in the release image, and their `TRACK2_*`
+> settings are intentionally ignored by PACT.
 
-| Agent | Package | Local Scenario | Internal Strategy |
-|-------|---------|----------------|-------------------|
-| Direct Cerebras agent | [`src/track_2_agent_under_test_cerebras/`](../src/track_2_agent_under_test_cerebras/) | [`scenarios/track_2_agent_under_test_cerebras/local_smoke.toml`](../scenarios/track_2_agent_under_test_cerebras/local_smoke.toml) | Cerebras `gpt-oss` executor returns schema-constrained next-action JSON. |
-| Cerebras planner/executor | [`src/track_2_agent_under_test_cerebras_planner/`](../src/track_2_agent_under_test_cerebras_planner/) | [`scenarios/track_2_agent_under_test_cerebras_planner/local_smoke.toml`](../scenarios/track_2_agent_under_test_cerebras_planner/local_smoke.toml) | Cerebras `gpt-oss` planner writes a compact plan with high reasoning effort; Cerebras `gpt-oss` executor returns normal A2A output with medium reasoning effort. |
+## Final Agent Map
 
-## Model Selection
+| Status | Agent | Package | Local Scenario | Internal Strategy |
+| --- | --- | --- | --- | --- |
+| **Final submission** | PACT | [`src/track_2_agent_under_test_cerebras/`](../src/track_2_agent_under_test_cerebras/) | [`scenarios/track_2_agent_under_test_cerebras/local_smoke.toml`](../scenarios/track_2_agent_under_test_cerebras/local_smoke.toml) | Cerebras is an untrusted semantic compiler; a strict decoder, typed PlanIR verifier, deterministic runtime, and evidence ledger control execution. |
+| Archived historical | Planner/executor V1 | `src/track_2_agent_under_test_cerebras_planner/` | Not a release scenario | Retained only for source-history comparison; do not configure or submit it. |
 
-The direct executor defaults to:
+The old rule-controller implementation once shared the final package path, but
+the package entry point now instantiates `PACTAgentExecutor`. Old descriptions
+of that package as a direct next-action executor are therefore historical, not
+descriptions of the reachable release runtime.
+
+The retained GHCR package and submission-directory names may still contain the
+word `direct` for compatibility. Those names do not select the archived
+controller; the release Dockerfile and server entry point select PACT.
+
+## Final Model and Runtime Configuration
+
+Use the `PACT_*` namespace for every submission-relevant model, provider, and
+budget setting:
 
 ```env
 CEREBRAS_API_KEY=...
-TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-TRACK2_EXECUTOR_REASONING_EFFORT=medium
+PACT_COMPILER_MODEL=gpt-oss-120b
+PACT_COMPILER_CEREBRAS_API_BASE=https://api.cerebras.ai
+PACT_COMPILER_SERVICE_TIER=
+PACT_COMPILER_REASONING_EFFORT=medium
+PACT_COMPILER_MAX_COMPLETION_TOKENS=8192
+PACT_COMPILER_SEMANTIC_REVIEW=true
+PACT_COMPILER_TEMPERATURE=
+PACT_COMPILER_MAX_REPAIR_ATTEMPTS=1
+PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES=3
+PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS=600
 ```
 
-The planner/executor template additionally defaults to:
+Leave `PACT_COMPILER_TEMPERATURE` unset to use the provider default. The final
+defaults use medium reasoning, an 8,192-token completion ceiling, semantic
+review for action-bearing plans, and at most one verifier-guided repair. See
+the [PACT configuration table](../src/track_2_agent_under_test_cerebras/README.md#configuration)
+for the complete set of provider and verifier bounds.
 
-```env
-TRACK2_PLANNER_MODEL=gpt-oss-120b
-TRACK2_PLANNER_REASONING_EFFORT=high
-TRACK2_PLANNER_MAX_COMPLETION_TOKENS=4096
-TRACK2_PLANNER_TEMPERATURE=
+Do not use `TRACK2_EXECUTOR_*`, `TRACK2_PLANNER_*`, or `TRACK2_CEREBRAS_*` in a
+new scenario. Those names belong to archived historical implementations and do
+not configure PACT. This fail-closed separation prevents a stale V1 environment
+from silently changing the submitted model, reasoning effort, or retry budget.
+
+## PACT Harness Pattern
+
+PACT separates probabilistic interpretation from deterministic execution:
+
+```text
+A2A event and live tool contracts
+  -> Cerebras strict-schema semantic compilation
+  -> compact wire-plan decoding
+  -> typed PlanIR construction and local verification
+  -> optional independent semantic audit for action-bearing plans
+  -> deterministic obligation runtime
+  -> one text response or one externally visible tool call
+  -> correlated result evidence and verified continuation
 ```
 
-Use Cerebras-hosted `gpt-oss` models for submitted Track 2 agents. Leave
-`TRACK2_PLANNER_TEMPERATURE` and `TRACK2_TEMPERATURE` unset to use provider
-defaults, or set them explicitly when needed.
+The model cannot call tools directly. The verifier checks live operation
+membership, complete argument schemas, dependency structure, confirmation
+contracts, resource bounds, and terminal evidence obligations. The runtime
+allows at most one pending external action and accepts its result only when the
+operation and argument/capability fingerprints match. Exact confirmations and
+successful actions advance an already verified immutable suffix; observations,
+free-form answers, revised confirmations, and capability changes trigger
+bounded replanning.
+
+Each compilation uses one proposal and at most one local-verification-guided
+repair. A locally valid plan containing an action receives one independently
+prompted full-policy and argument-provenance audit, after which its output is
+strictly decoded and verified again. The worst semantic path is three
+sequential completions, below Track 2's five-call limit. Answer-only and
+refusal-only plans skip the audit.
 
 ## Cerebras Development Logistics
 
-Free personal Cerebras accounts can have strict rate limits during development,
-so use smaller smoke scenarios first, keep completion budgets tight, and
-schedule large runs externally rather than launching many at once. The reference
-templates do not do proactive local
-request/token quota pacing before calls. They retry reactively only after a
-provider-visible Cerebras 429:
+Free personal Cerebras accounts can have strict rate limits, so begin with the
+smallest smoke scenario. PACT bounds both retry count and cumulative wait time
+with `PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES` and
+`PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS`. It uses provider reset hints when
+available and fails closed when the configured budget is exhausted.
 
-```env
-TRACK2_CEREBRAS_QUEUE_BACKOFF_SECONDS=60
-TRACK2_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO=0.1
-TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MIN_SECONDS=90
-TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS=120
-TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS=180
-TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS=300
-TRACK2_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS=1
-```
+Known Cerebras `queue_exceeded` and `token_quota_exceeded` responses produce
+diagnostic JSON reports under `CAR_BENCH_CEREBRAS_RATE_LIMIT_REPORT_DIR`, then
+`CAR_BENCH_RATE_LIMIT_REPORT_DIR`, or
+`/tmp/car-bench-rate-limit-reports` by default. These reports support debugging
+and reproducibility; they are not fabricated timing or scoring metadata.
+`avg_llm_call_time_ms` includes successful provider calls only, while aggregate
+token usage includes all successful internal completions used for the turn.
 
-The reference templates compute `avg_llm_call_time_ms` only from successful
-provider calls. Failed 429 attempts are visible in logs/reports but do not enter
-submitted LLM latency.
+## Track 2 Accounting
 
-Cerebras will provide increased rate limits compared with a free personal
-account; access details will follow soon. Participants may also self-host the
-open-source models used by the Cerebras `gpt-oss` executor during development,
-then switch to the Cerebras endpoint for official validation.
+Track 2 permits up to five sequential LLM calls per baseline LLM step, allows
+parallel calls inside a step, and limits average task usage to 500k aggregate
+input, reasoning, and output tokens. PACT reports all successful internal calls
+through the existing A2A `turn_metrics` fields:
 
-Codex with `gpt-5.3-codex-spark` is not the runtime used by the new
-submitted-agent templates.
+- `prompt_tokens`
+- `completion_tokens`
+- `thinking_tokens`
 
-## Pattern 1: Direct Next-Action Baseline
+The three fields are disjoint. Because Cerebras includes reasoning tokens in
+provider output tokens, PACT reports visible completion as
+`max(0, output_tokens - reasoning_output_tokens)` and reports reasoning only as
+`thinking_tokens`. Sequential-call structure belongs in the technical-report
+architecture diagram rather than a new A2A metadata field.
 
-Each CAR-bench assistant step becomes one Cerebras SDK call:
+## Archived Historical Patterns
 
-```text
-A2A input from evaluator
-  -> build transcript and task-filtered tool prompt
-  -> Cerebras next-action JSON
-  -> parse JSON
-  -> return text Part or data Part(tool_calls) to evaluator
-```
+The following patterns explain repository history only. They must not be used
+to configure, validate, describe, or submit the final Track 2 agent.
 
-This is the lowest-latency and easiest-to-debug Track 2 template. It is the best
-starting point before adding planners, verifiers, rerankers, or ensembles.
+### Archived: Direct Next-Action Controller
 
-## Pattern 2: Cerebras High-Effort Planner Plus Medium-Effort Executor
+The original baseline made one Cerebras call per assistant step and forwarded a
+schema-constrained next action after lightweight parsing. It predated PACT's
+typed PlanIR verification, obligation runtime, evidence ledger, and independent
+action audit. References to a “direct executor,” `TRACK2_EXECUTOR_*`, or
+`TRACK2_TEMPERATURE` describe this archived historical design.
 
-Use a high-reasoning Cerebras `gpt-oss` planner to write compact private
-guidance, then let a medium-reasoning Cerebras `gpt-oss` executor produce the
-benchmark-visible next action. The reference planner runs when a new user turn
-arrives. Tool-result continuation turns reuse the active private plan until the
-executor returns a final user response.
+### Archived: High-Effort Planner Plus Medium-Effort Executor
 
-The private plan is not a CAR-bench tool call and is never returned to the
-evaluator. If the executor needs benchmark-visible planning behavior, it can
-call CAR-bench's supplied `planning_tool` like any other available tool.
+The V1 planner/executor generated private guidance with one model call and then
+used another model call for the benchmark-visible action. It lived under
+`src/track_2_agent_under_test_cerebras_planner/` and used
+`TRACK2_PLANNER_*` settings. That directory is retained for comparison only; it
+has no final publish target and is excluded from the PACT release image.
 
-## Rate-Limit Accounting
-
-The Cerebras templates write an audit report when a known Cerebras 429 shape is
-observed. Reports are written to
-`CAR_BENCH_CEREBRAS_RATE_LIMIT_REPORT_DIR`, falling back to
-`CAR_BENCH_RATE_LIMIT_REPORT_DIR`, then `/tmp/car-bench-rate-limit-reports`.
-
-The observed Cerebras shapes are:
-
-- `queue_exceeded` with `param: "queue"` on the original provider error. This
-  means the provider queue is saturated. If Cerebras sends `retry-after`, the
-  template respects it; otherwise it applies jittered local backoff: roughly
-  60 seconds on the first queue retry, 90-120 seconds on the second, and
-  180-300 seconds on later queue retries.
-- `token_quota_exceeded` with `param: "quota"` and `retry-after` or
-  `x-ratelimit-reset-*` headers. This means a request/token quota window has a
-  provider-visible reset hint, so the template applies that wait plus
-  `TRACK2_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS` before retrying.
-
-For quota 429s, the client prefers `x-ratelimit-reset-tokens-minute` because it
-directly names the token window that usually bites first. If that header is
-missing, the log and JSON report call it out and the client falls back to
-`x-ratelimit-reset-requests-day` or `retry-after` when present. The terminal
-shows the wait duration, resume time, reason, source header, available reset
-values, and missing expected headers.
-
-Rate-limit reports include session start time, wall time until the limit, wall
-time since the previous rate-limit and retry markers, successful-call token
-usage, estimated attempted request tokens, the failed call shape, wait decision,
-and raw provider payloads. These files are for diagnosis, reproducibility, and
-future audit.
-
-Final quota-wait accounting details will be announced before the official
-evaluation. Until then, treat rate-limit reports as evidence for understanding
-provider behavior rather than as a final scoring-policy contract. Do not
-fabricate timing metadata. Successful planner/executor calls still count as LLM
-calls for `num_llm_calls` and `avg_llm_call_time_ms`.
-
-Track 2 uses inference-compute constraints: up to 5 sequential LLM calls per
-baseline LLM step, parallel calls allowed within a step, and average usage up
-to 500k input/reasoning/output tokens on average per task. Aggregate token usage into the
-existing `turn_metrics`
-`prompt_tokens`, `completion_tokens`, and `thinking_tokens` fields. Keep
-`num_passes` in its existing internal-pass role; describe the Track 2
-sequential-call structure in the technical-report architecture diagram.
+For current commands and the exact submission configuration, return to the
+[PACT agent README](../src/track_2_agent_under_test_cerebras/README.md).

@@ -1,0 +1,35 @@
+# CAR-bench Track 2 final submission: PACT with direct Cerebras inference.
+# The image must be public, linux/amd64, and pinned by its GHCR registry digest.
+# Do not put secret values in this file.
+
+[evaluator]
+image = "ghcr.io/car-bench/car-bench-evaluator:latest"
+
+[evaluator.env]
+GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY}"
+LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
+
+[agent_under_test]
+image = "ghcr.io/puyanguvic/car-bench-track-2-direct@sha256:173fd630e1691b40af55e731e82023c1df9cfcae52d3b84420c1d307eccea6d1"
+
+[agent_under_test.env]
+CEREBRAS_API_KEY = "${CEREBRAS_API_KEY:?Set CEREBRAS_API_KEY}"
+PACT_COMPILER_MODEL = "${PACT_COMPILER_MODEL:-gpt-oss-120b}"
+PACT_COMPILER_CEREBRAS_API_BASE = "${PACT_COMPILER_CEREBRAS_API_BASE:-https://api.cerebras.ai}"
+PACT_COMPILER_SERVICE_TIER = "${PACT_COMPILER_SERVICE_TIER:-}"
+PACT_COMPILER_REASONING_EFFORT = "${PACT_COMPILER_REASONING_EFFORT:-medium}"
+PACT_COMPILER_MAX_COMPLETION_TOKENS = "${PACT_COMPILER_MAX_COMPLETION_TOKENS:-8192}"
+PACT_COMPILER_SEMANTIC_REVIEW = "${PACT_COMPILER_SEMANTIC_REVIEW:-true}"
+PACT_COMPILER_TEMPERATURE = "${PACT_COMPILER_TEMPERATURE:-}"
+PACT_COMPILER_MAX_REPAIR_ATTEMPTS = "${PACT_COMPILER_MAX_REPAIR_ATTEMPTS:-1}"
+PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES = "${PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES:-3}"
+PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS = "${PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS:-600}"
+LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
+
+[config]
+num_trials = 3
+task_split = "hidden"
+tasks_base_num_tasks = -1
+tasks_hallucination_num_tasks = -1
+tasks_disambiguation_num_tasks = -1
+max_steps = 50

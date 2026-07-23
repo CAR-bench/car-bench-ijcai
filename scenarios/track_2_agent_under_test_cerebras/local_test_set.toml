@@ -1,4 +1,4 @@
-# Local full test-set scenario for the Track 2 Cerebras agent under test.
+# Local full test-set scenario for the PACT Track 2 agent under test.
 
 [evaluator]
 endpoint = "http://127.0.0.1:8081"

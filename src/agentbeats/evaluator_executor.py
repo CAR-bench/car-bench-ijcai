@@ -6,7 +6,6 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import (
-    Task,
     TaskState,
 )
 from a2a.helpers.proto_helpers import (

@@ -1,4 +1,4 @@
-"""Cerebras SDK client and reactive rate-limit handling for Track 2 agents."""
+"""Cerebras SDK client with proactive pacing and reactive rate-limit handling."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 from uuid import uuid4
 
 
@@ -28,6 +28,9 @@ DEFAULT_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS = 120.0
 DEFAULT_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS = 180.0
 DEFAULT_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS = 300.0
 DEFAULT_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS = 1.0
+DEFAULT_CEREBRAS_TOKEN_QUOTA_WINDOW_SECONDS = 60.0
+DEFAULT_CEREBRAS_MAX_RATE_LIMIT_RETRIES = 3
+DEFAULT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS = 600.0
 CEREBRAS_RATE_LIMIT_HEADER_NAMES = (
     "x-ratelimit-limit-requests-day",
     "x-ratelimit-limit-tokens-minute",
@@ -44,6 +47,40 @@ class CerebrasTemplateError(RuntimeError):
 
 class MalformedModelResponseError(CerebrasTemplateError):
     """Raised when the model output cannot be parsed as the expected JSON."""
+
+
+class CerebrasRateLimitBudgetExceededError(CerebrasTemplateError):
+    """Raised when a bounded rate-limit retry cannot be scheduled safely.
+
+    The exception intentionally contains only local counters and configuration.
+    Provider exception text, response bodies, headers, prompts, and credentials are
+    excluded so callers may surface or log it without leaking provider data.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        retries_completed: int,
+        max_retries: int,
+        cumulative_wait_seconds: float,
+        max_wait_seconds: float,
+        next_wait_seconds: float,
+    ) -> None:
+        self.reason = reason
+        self.retries_completed = retries_completed
+        self.max_retries = max_retries
+        self.cumulative_wait_seconds = cumulative_wait_seconds
+        self.max_wait_seconds = max_wait_seconds
+        self.next_wait_seconds = next_wait_seconds
+        super().__init__(
+            "Cerebras rate-limit retry budget exhausted "
+            f"(reason={reason}, retries_completed={retries_completed}, "
+            f"max_retries={max_retries}, "
+            f"cumulative_wait_seconds={cumulative_wait_seconds:.3f}, "
+            f"max_wait_seconds={max_wait_seconds:.3f}, "
+            f"next_wait_seconds={next_wait_seconds:.3f})"
+        )
 
 
 @dataclass
@@ -64,9 +101,7 @@ class TokenUsage:
         prompt_details = _get_field(usage, "prompt_tokens_details")
         return cls(
             input_tokens=_safe_int(_get_field(usage, "prompt_tokens")),
-            cached_input_tokens=_safe_int(
-                _get_field(prompt_details, "cached_tokens")
-            ),
+            cached_input_tokens=_safe_int(_get_field(prompt_details, "cached_tokens")),
             output_tokens=_safe_int(_get_field(usage, "completion_tokens")),
             reasoning_output_tokens=_safe_int(
                 _get_field(completion_details, "reasoning_tokens")
@@ -136,6 +171,8 @@ class CerebrasRateLimitHeaders:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        """Return parsed numeric quota data without raw provider header text."""
+
         return {
             "limit_requests_day": self.limit_requests_day,
             "limit_tokens_minute": self.limit_tokens_minute,
@@ -143,7 +180,10 @@ class CerebrasRateLimitHeaders:
             "remaining_tokens_minute": self.remaining_tokens_minute,
             "reset_requests_day_seconds": self.reset_requests_day_seconds,
             "reset_tokens_minute_seconds": self.reset_tokens_minute_seconds,
-            "raw_headers": self.raw_headers,
+            # Raw header values are provider-controlled and may contain
+            # diagnostic text. Parsed finite numbers above are sufficient for
+            # pacing and safe persistence.
+            "raw_headers": None,
         }
 
 
@@ -185,11 +225,33 @@ class CerebrasRateLimitSignal:
     queue_backoff_max_seconds: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        """Return a log-safe projection of a provider-controlled error.
+
+        Provider error messages and arbitrary token-like fields are not audit
+        metadata: they can echo request content or credentials.  Scheduling
+        uses the original in-memory fields, while persistent reports receive
+        only allow-listed diagnostic categories and numeric timing data.
+        """
+
         return {
-            "code": self.code,
-            "type": self.type,
-            "param": self.param,
-            "message": self.message,
+            "code": _allowlisted_diagnostic(
+                self.code,
+                {
+                    "queue_exceeded",
+                    "request_quota_exceeded",
+                    "token_quota_exceeded",
+                },
+            ),
+            "type": _allowlisted_diagnostic(
+                self.type,
+                {
+                    "rate_limit_error",
+                    "too_many_requests_error",
+                    "too_many_tokens_error",
+                },
+            ),
+            "param": _allowlisted_diagnostic(self.param, {"queue", "quota"}),
+            "message": None,
             "source": self.source,
             "retry_after_seconds": self.retry_after_seconds,
             "reset_tokens_minute_seconds": self.reset_tokens_minute_seconds,
@@ -198,7 +260,10 @@ class CerebrasRateLimitSignal:
             "schedule_reason": self.schedule_reason,
             "wait_source_header": self.wait_source_header,
             "missing_expected_headers": list(self.missing_expected_headers),
-            "x_should_retry": self.x_should_retry,
+            "x_should_retry": _allowlisted_diagnostic(
+                self.x_should_retry,
+                {"0", "1", "false", "true"},
+            ),
             "quota_wait_eligible": self.quota_wait_eligible,
             "queue_retry_attempt": self.queue_retry_attempt,
             "queue_backoff_min_seconds": self.queue_backoff_min_seconds,
@@ -242,32 +307,48 @@ class CerebrasCompletionClient:
         self.service_tier = service_tier.strip() if service_tier else None
         self.logger = logger
         self.queue_backoff_seconds = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_SECONDS",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_SECONDS",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_SECONDS,
         )
         self.queue_backoff_initial_jitter_ratio = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO,
         )
         self.queue_backoff_second_min_seconds = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MIN_SECONDS",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_SECOND_MIN_SECONDS",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_SECOND_MIN_SECONDS,
         )
         self.queue_backoff_second_max_seconds = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_SECOND_MAX_SECONDS,
         )
         self.queue_backoff_cap_min_seconds = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_CAP_MIN_SECONDS,
         )
         self.queue_backoff_cap_max_seconds = _env_float(
-            "TRACK2_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS",
+            ("PACT_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS",),
             DEFAULT_CEREBRAS_QUEUE_BACKOFF_CAP_MAX_SECONDS,
         )
         self.rate_limit_retry_buffer_seconds = _env_float(
-            "TRACK2_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS",
+            ("PACT_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS",),
             DEFAULT_CEREBRAS_RATE_LIMIT_RETRY_BUFFER_SECONDS,
+        )
+        self.proactive_token_pacing = _env_bool(
+            ("PACT_CEREBRAS_PROACTIVE_TOKEN_PACING",),
+            default=True,
+        )
+        self.token_quota_window_seconds = _env_float(
+            ("PACT_CEREBRAS_TOKEN_QUOTA_WINDOW_SECONDS",),
+            DEFAULT_CEREBRAS_TOKEN_QUOTA_WINDOW_SECONDS,
+        )
+        self.max_rate_limit_retries = _env_nonnegative_int(
+            ("PACT_CEREBRAS_MAX_RATE_LIMIT_RETRIES",),
+            DEFAULT_CEREBRAS_MAX_RATE_LIMIT_RETRIES,
+        )
+        self.max_rate_limit_wait_seconds = _env_nonnegative_float(
+            ("PACT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS",),
+            DEFAULT_CEREBRAS_MAX_RATE_LIMIT_WAIT_SECONDS,
         )
         self.rate_limit_report_dir = Path(
             os.getenv(
@@ -341,12 +422,37 @@ class CerebrasCompletionClient:
         quota_wait_ms = 0.0
         rate_limit_retries = 0
         queue_retries = 0
+        cumulative_rate_limit_wait_seconds = 0.0
 
-        while True:
+        for _request_attempt in range(self.max_rate_limit_retries + 1):
             estimated_tokens = estimate_request_tokens(
                 messages=messages,
                 max_completion_tokens=max_completion_tokens,
             )
+            proactive_wait_seconds = self._proactive_quota_wait_seconds(
+                model=normalized_model,
+                estimated_tokens=estimated_tokens,
+            )
+            if proactive_wait_seconds > 0:
+                self._check_rate_limit_wait_budget(
+                    reason="proactive_wait_limit",
+                    retries_completed=rate_limit_retries,
+                    next_wait_seconds=proactive_wait_seconds,
+                    cumulative_wait_seconds=cumulative_rate_limit_wait_seconds,
+                    check_retry_limit=False,
+                )
+                quota_wait_ms += proactive_wait_seconds * 1000.0
+                cumulative_rate_limit_wait_seconds += proactive_wait_seconds
+                if self.logger:
+                    self.logger.info(
+                        "Waiting for Cerebras token quota before request",
+                        model=normalized_model,
+                        estimated_request_tokens=estimated_tokens,
+                        wait_seconds=round(proactive_wait_seconds, 3),
+                        wait_source="previous_successful_rate_limit_headers",
+                    )
+                time.sleep(proactive_wait_seconds)
+                self._clear_rate_limit_headers(normalized_model)
             previous_request_state = self._record_attempt(
                 model=normalized_model,
                 estimated_tokens=estimated_tokens,
@@ -386,28 +492,25 @@ class CerebrasCompletionClient:
                 )
             start = time.perf_counter()
             try:
-                raw_response = (
-                    self._client.chat.completions.with_raw_response.create(**kwargs)
+                raw_response = self._client.chat.completions.with_raw_response.create(
+                    **kwargs
                 )
                 completion = raw_response.parse()
             except Exception as exc:
                 duration_ms = (time.perf_counter() - start) * 1000.0
-                details, rate_limit_signal, report_path = (
-                    self._handle_completion_error(
-                        exc=exc,
-                        model=normalized_model,
-                        messages=messages,
-                        response_schema=response_schema,
-                        response_schema_name=response_schema_name,
-                        max_completion_tokens=max_completion_tokens,
-                        reasoning_effort=normalized_reasoning_effort,
-                        estimated_tokens=estimated_tokens,
-                        duration_ms=duration_ms,
-                        queue_retry_attempt=queue_retries + 1,
-                    )
+                details, rate_limit_signal, report_path = self._handle_completion_error(
+                    exc=exc,
+                    model=normalized_model,
+                    messages=messages,
+                    response_schema=response_schema,
+                    response_schema_name=response_schema_name,
+                    max_completion_tokens=max_completion_tokens,
+                    reasoning_effort=normalized_reasoning_effort,
+                    estimated_tokens=estimated_tokens,
+                    duration_ms=duration_ms,
+                    queue_retry_attempt=queue_retries + 1,
                 )
                 self._log_cerebras_error(
-                    exc,
                     details=details,
                     rate_limit_signal=rate_limit_signal,
                     report_path=report_path,
@@ -418,11 +521,19 @@ class CerebrasCompletionClient:
                     and rate_limit_signal.schedule_wait_seconds > 0
                 ):
                     wait_seconds = rate_limit_signal.schedule_wait_seconds
+                    self._check_rate_limit_wait_budget(
+                        reason="reactive_retry_limit",
+                        retries_completed=rate_limit_retries,
+                        next_wait_seconds=wait_seconds,
+                        cumulative_wait_seconds=cumulative_rate_limit_wait_seconds,
+                        check_retry_limit=True,
+                    )
                     rate_limit_retries += 1
                     if _is_queue_rate_limit_signal(rate_limit_signal):
                         queue_retries += 1
                     if rate_limit_signal.quota_wait_eligible:
                         quota_wait_ms += wait_seconds * 1000.0
+                    cumulative_rate_limit_wait_seconds += wait_seconds
                     if self.logger:
                         resume_at = _format_future_time(wait_seconds)
                         self.logger.warning(
@@ -436,21 +547,15 @@ class CerebrasCompletionClient:
                             wait_seconds=round(wait_seconds, 3),
                             resume_at=resume_at,
                             wait_reason=rate_limit_signal.schedule_reason,
-                            wait_source_header=(
-                                rate_limit_signal.wait_source_header
-                            ),
-                            retry_after_seconds=(
-                                rate_limit_signal.retry_after_seconds
-                            ),
+                            wait_source_header=(rate_limit_signal.wait_source_header),
+                            retry_after_seconds=(rate_limit_signal.retry_after_seconds),
                             reset_tokens_minute_seconds=(
                                 rate_limit_signal.reset_tokens_minute_seconds
                             ),
                             reset_requests_day_seconds=(
                                 rate_limit_signal.reset_requests_day_seconds
                             ),
-                            queue_retry_attempt=(
-                                rate_limit_signal.queue_retry_attempt
-                            ),
+                            queue_retry_attempt=(rate_limit_signal.queue_retry_attempt),
                             queue_backoff_min_seconds=(
                                 rate_limit_signal.queue_backoff_min_seconds
                             ),
@@ -465,18 +570,21 @@ class CerebrasCompletionClient:
                             report_path=str(report_path) if report_path else None,
                         )
                     time.sleep(wait_seconds)
+                    self._clear_rate_limit_headers(normalized_model)
                     continue
+                # SDK exception strings may contain response bodies, request
+                # fragments, or credentials.  The detailed cause is consumed
+                # above for in-memory classification only and must not cross
+                # this public exception boundary.
                 raise CerebrasTemplateError(
-                    f"Cerebras completion failed for {normalized_model}: {exc}"
-                ) from exc
+                    f"Cerebras completion failed for {normalized_model}"
+                ) from None
 
             duration_ms = (time.perf_counter() - start) * 1000.0
             choice = completion.choices[0]
             message = choice.message
             finish_reason = getattr(choice, "finish_reason", None)
-            usage = TokenUsage.from_provider_usage(
-                getattr(completion, "usage", None)
-            )
+            usage = TokenUsage.from_provider_usage(getattr(completion, "usage", None))
             rate_limit_headers = CerebrasRateLimitHeaders.from_headers(
                 getattr(raw_response, "headers", None)
             )
@@ -486,6 +594,7 @@ class CerebrasCompletionClient:
                 rate_limit_headers=rate_limit_headers,
             )
             if self.logger:
+                response_text = _message_content(message)
                 self.logger.info(
                     "Cerebras response received",
                     model=getattr(completion, "model", None) or normalized_model,
@@ -500,9 +609,13 @@ class CerebrasCompletionClient:
                         else None
                     ),
                     quota_wait_ms=round(quota_wait_ms, 1),
+                    content_type=type(_get_field(message, "content")).__name__,
+                    content_chars=len(response_text),
                 )
+            else:
+                response_text = _message_content(message)
             return CompletionCallResult(
-                text=_message_content(message),
+                text=response_text,
                 duration_ms=duration_ms,
                 model=getattr(completion, "model", None) or normalized_model,
                 finish_reason=finish_reason,
@@ -512,6 +625,49 @@ class CerebrasCompletionClient:
                 rate_limit_headers=rate_limit_headers,
                 quota_wait_ms=quota_wait_ms,
             )
+
+        # Every normal path returns, raises, or consumes a bounded retry above.
+        # Keep a typed fail-closed guard in case future edits add another continue.
+        raise CerebrasRateLimitBudgetExceededError(
+            reason="retry_loop_exhausted",
+            retries_completed=rate_limit_retries,
+            max_retries=self.max_rate_limit_retries,
+            cumulative_wait_seconds=cumulative_rate_limit_wait_seconds,
+            max_wait_seconds=self.max_rate_limit_wait_seconds,
+            next_wait_seconds=0.0,
+        ) from None
+
+    def _check_rate_limit_wait_budget(
+        self,
+        *,
+        reason: str,
+        retries_completed: int,
+        next_wait_seconds: float,
+        cumulative_wait_seconds: float,
+        check_retry_limit: bool,
+    ) -> None:
+        """Fail before sleeping when either per-call rate-limit budget is spent."""
+
+        retry_limit_exceeded = (
+            check_retry_limit and retries_completed >= self.max_rate_limit_retries
+        )
+        wait_limit_exceeded = (
+            not math.isfinite(next_wait_seconds)
+            or cumulative_wait_seconds + next_wait_seconds
+            > self.max_rate_limit_wait_seconds
+        )
+        if not retry_limit_exceeded and not wait_limit_exceeded:
+            return
+
+        exhausted_reason = reason if retry_limit_exceeded else "cumulative_wait_limit"
+        raise CerebrasRateLimitBudgetExceededError(
+            reason=exhausted_reason,
+            retries_completed=retries_completed,
+            max_retries=self.max_rate_limit_retries,
+            cumulative_wait_seconds=cumulative_wait_seconds,
+            max_wait_seconds=self.max_rate_limit_wait_seconds,
+            next_wait_seconds=next_wait_seconds,
+        ) from None
 
     @property
     def _client(self) -> Any:
@@ -546,7 +702,7 @@ class CerebrasCompletionClient:
             kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": response_schema_name or "car_bench_response",
+                    "name": response_schema_name or "structured_response",
                     "strict": True,
                     "schema": response_schema,
                 },
@@ -574,12 +730,8 @@ class CerebrasCompletionClient:
             queue_backoff_initial_jitter_ratio=(
                 self.queue_backoff_initial_jitter_ratio
             ),
-            queue_backoff_second_min_seconds=(
-                self.queue_backoff_second_min_seconds
-            ),
-            queue_backoff_second_max_seconds=(
-                self.queue_backoff_second_max_seconds
-            ),
+            queue_backoff_second_min_seconds=(self.queue_backoff_second_min_seconds),
+            queue_backoff_second_max_seconds=(self.queue_backoff_second_max_seconds),
             queue_backoff_cap_min_seconds=self.queue_backoff_cap_min_seconds,
             queue_backoff_cap_max_seconds=self.queue_backoff_cap_max_seconds,
             queue_retry_attempt=queue_retry_attempt,
@@ -596,10 +748,10 @@ class CerebrasCompletionClient:
                 reasoning_effort=reasoning_effort,
                 estimated_tokens=estimated_tokens,
                 duration_ms=duration_ms,
-                error_details=details,
+                error_details=_safe_exception_diagnostics(details),
                 rate_limit_signal=signal,
             )
-        return details, signal, report_path
+        return _safe_exception_diagnostics(details), signal, report_path
 
     def _record_attempt(
         self,
@@ -608,8 +760,8 @@ class CerebrasCompletionClient:
         estimated_tokens: int,
     ) -> dict[str, Any]:
         with self._metrics_lock:
-            previous_estimated_tokens = self._last_estimated_request_tokens_by_model.get(
-                model
+            previous_estimated_tokens = (
+                self._last_estimated_request_tokens_by_model.get(model)
             )
             previous_successful_usage = self._last_successful_token_usage_by_model.get(
                 model
@@ -623,8 +775,7 @@ class CerebrasCompletionClient:
             )
             self._estimated_request_tokens += estimated_tokens
             self._estimated_request_tokens_by_model[model] = (
-                self._estimated_request_tokens_by_model.get(model, 0)
-                + estimated_tokens
+                self._estimated_request_tokens_by_model.get(model, 0) + estimated_tokens
             )
             self._last_estimated_request_tokens_by_model[model] = estimated_tokens
 
@@ -644,11 +795,40 @@ class CerebrasCompletionClient:
             if previous_successful_usage is not None
             else None,
             "previous_rate_limit_headers": (
-                previous_headers.as_dict()
-                if previous_headers is not None
-                else None
+                previous_headers.as_dict() if previous_headers is not None else None
             ),
         }
+
+    def _proactive_quota_wait_seconds(
+        self,
+        *,
+        model: str,
+        estimated_tokens: int,
+    ) -> float:
+        """Avoid a known token-quota rejection when the last response exposes it."""
+
+        if not self.proactive_token_pacing:
+            return 0.0
+        with self._metrics_lock:
+            snapshot = self._last_rate_limit_headers_by_model.get(model)
+        if snapshot is None:
+            return 0.0
+
+        headers, observed_at = snapshot
+        remaining = headers.remaining_tokens_minute
+        if remaining is None or estimated_tokens <= remaining:
+            return 0.0
+
+        if headers.reset_tokens_minute_seconds is not None:
+            reset_seconds = headers.reset_tokens_minute_seconds
+        else:
+            elapsed = max(0.0, time.perf_counter() - observed_at)
+            reset_seconds = max(0.0, self.token_quota_window_seconds - elapsed)
+        return max(0.0, reset_seconds + self.rate_limit_retry_buffer_seconds)
+
+    def _clear_rate_limit_headers(self, model: str) -> None:
+        with self._metrics_lock:
+            self._last_rate_limit_headers_by_model.pop(model, None)
 
     def _record_successful_call(
         self,
@@ -663,14 +843,20 @@ class CerebrasCompletionClient:
                 self._successful_calls_by_model.get(model, 0) + 1
             )
             if token_usage is not None:
-                self._total_token_usage = add_token_usage(
-                    self._total_token_usage,
-                    token_usage,
-                ) or TokenUsage()
-                self._token_usage_by_model[model] = add_token_usage(
-                    self._token_usage_by_model.get(model),
-                    token_usage,
-                ) or TokenUsage()
+                self._total_token_usage = (
+                    add_token_usage(
+                        self._total_token_usage,
+                        token_usage,
+                    )
+                    or TokenUsage()
+                )
+                self._token_usage_by_model[model] = (
+                    add_token_usage(
+                        self._token_usage_by_model.get(model),
+                        token_usage,
+                    )
+                    or TokenUsage()
+                )
                 self._last_successful_token_usage_by_model[model] = token_usage
             if rate_limit_headers is not None:
                 self._last_rate_limit_headers_by_model[model] = (
@@ -759,9 +945,7 @@ class CerebrasCompletionClient:
                 else None
             ),
             "previous_retry_at": (
-                previous_retry_at.isoformat()
-                if previous_retry_at is not None
-                else None
+                previous_retry_at.isoformat() if previous_retry_at is not None else None
             ),
             "wall_time_since_previous_retry_at_seconds": (
                 round(wall_time_since_previous_retry_at, 3)
@@ -874,7 +1058,6 @@ class CerebrasCompletionClient:
 
     def _log_cerebras_error(
         self,
-        exc: BaseException,
         *,
         details: dict[str, Any],
         rate_limit_signal: CerebrasRateLimitSignal | None,
@@ -889,14 +1072,14 @@ class CerebrasCompletionClient:
             "Cerebras SDK error observed",
             exception_type=details.get("exception_type"),
             status_code=details.get("status_code"),
-            message=details.get("message"),
             rate_limit_signal=signal_dict,
-            rate_limit_report_path=str(report_path) if report_path is not None else None,
+            rate_limit_report_path=str(report_path)
+            if report_path is not None
+            else None,
         )
         self.logger.debug(
-            "Cerebras SDK raw error details",
-            raw_error_details=_json_safe(details),
-            exception=str(exc),
+            "Cerebras SDK error diagnostics",
+            diagnostics=_json_safe(details),
         )
 
 
@@ -911,14 +1094,10 @@ def estimate_request_tokens(
 
     chars_per_token = max(chars_per_token, 1.0)
     safety_factor = max(safety_factor, 1.0)
-    prompt_chars = len(
-        json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-    )
+    prompt_chars = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
     estimated_prompt_tokens = max(1, math.ceil(prompt_chars / chars_per_token))
     completion_budget = max(0, max_completion_tokens)
-    return math.ceil(
-        (estimated_prompt_tokens + completion_budget) * safety_factor
-    )
+    return math.ceil((estimated_prompt_tokens + completion_budget) * safety_factor)
 
 
 def normalize_cerebras_model(model: str) -> str:
@@ -1031,20 +1210,15 @@ def _rate_limit_candidate(
         _header_value(headers_dict, "x-ratelimit-reset-requests-day")
     )
     is_429 = _safe_int(status_code) == 429
-    is_rate_limit_payload = (
-        code
-        in {
-            "queue_exceeded",
-            "token_quota_exceeded",
-            "request_quota_exceeded",
-        }
-        or error_type
-        in {
-            "too_many_requests_error",
-            "too_many_tokens_error",
-            "rate_limit_error",
-        }
-    )
+    is_rate_limit_payload = code in {
+        "queue_exceeded",
+        "token_quota_exceeded",
+        "request_quota_exceeded",
+    } or error_type in {
+        "too_many_requests_error",
+        "too_many_tokens_error",
+        "rate_limit_error",
+    }
     if not is_429 and not is_rate_limit_payload:
         return None
 
@@ -1211,21 +1385,16 @@ def _format_rate_limit_wait_message(
             f"{signal.queue_backoff_max_seconds:.3f}s"
         )
     if signal.reset_tokens_minute_seconds is not None:
-        parts.append(
-            f"reset_tokens_minute={signal.reset_tokens_minute_seconds:.3f}s"
-        )
+        parts.append(f"reset_tokens_minute={signal.reset_tokens_minute_seconds:.3f}s")
     elif "x-ratelimit-reset-tokens-minute" in signal.missing_expected_headers:
         parts.append("reset_tokens_minute=missing")
     if signal.reset_requests_day_seconds is not None:
-        parts.append(
-            f"reset_requests_day={signal.reset_requests_day_seconds:.3f}s"
-        )
+        parts.append(f"reset_requests_day={signal.reset_requests_day_seconds:.3f}s")
     if signal.retry_after_seconds is not None:
         parts.append(f"retry_after={signal.retry_after_seconds:.3f}s")
     if signal.missing_expected_headers:
         parts.append(
-            "missing_expected_headers="
-            + ",".join(signal.missing_expected_headers)
+            "missing_expected_headers=" + ",".join(signal.missing_expected_headers)
         )
     parts.append(f"quota_wait_eligible={signal.quota_wait_eligible}")
     if report_path is not None:
@@ -1282,6 +1451,50 @@ def _exception_details(exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _safe_exception_diagnostics(details: dict[str, Any]) -> dict[str, Any]:
+    """Project raw SDK error data into non-secret persistent diagnostics.
+
+    The raw structure is needed briefly to classify 429 responses, but it may
+    contain provider bodies, arbitrary headers, exception attributes, and
+    chained exception text.  None of those values are safe to write or log.
+    """
+
+    status_code = details.get("status_code")
+    return {
+        "exception_type": _safe_class_name(details.get("exception_type")),
+        "exception_module": _safe_module_name(details.get("exception_module")),
+        "status_code": _safe_http_status(status_code),
+    }
+
+
+def _safe_class_name(value: Any) -> str:
+    text = str(value) if value is not None else "Exception"
+    return text if text.replace("_", "").isalnum() else "Exception"
+
+
+def _safe_module_name(value: Any) -> str:
+    text = str(value) if value is not None else "unknown"
+    return text if text.replace("_", "").replace(".", "").isalnum() else "unknown"
+
+
+def _safe_http_status(value: Any) -> int | None:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _allowlisted_diagnostic(
+    value: str | None,
+    allowed: set[str],
+) -> str | None:
+    if value is None:
+        return None
+    normalized = value.casefold()
+    return normalized if normalized in allowed else "other"
+
+
 def _provider_error_body(exc: BaseException, response_json: Any = None) -> Any:
     for candidate in (
         getattr(exc, "body", None),
@@ -1315,6 +1528,18 @@ def _message_content(message: Any) -> str:
     content = _get_field(message, "content")
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        # Some OpenAI-compatible SDK versions deserialize structured-output
+        # content into a mapping instead of preserving the JSON string.  A
+        # Python ``str(dict)`` is not JSON (single quotes, non-JSON literals),
+        # so serialize it canonically before it crosses the compiler boundary.
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     if isinstance(content, list):
         text_parts = []
         for part in content:
@@ -1421,11 +1646,79 @@ def _safe_float_or_none(value: Any) -> float | None:
         return None
 
 
-def _env_float(name: str, default: float | None = None) -> float | None:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
+@overload
+def _env_float(name: str | tuple[str, ...], default: float) -> float: ...
+
+
+@overload
+def _env_float(name: str | tuple[str, ...], default: None = None) -> float | None: ...
+
+
+def _env_float(
+    name: str | tuple[str, ...], default: float | None = None
+) -> float | None:
+    names = (name,) if isinstance(name, str) else name
+    configured_name, value = _first_configured_env(names)
+    if value is None:
         return default
-    return float(value)
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(
+            f"{configured_name} must be a finite non-negative number"
+        ) from None
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(
+            f"{configured_name} must be a finite non-negative number"
+        ) from None
+    return parsed
+
+
+def _env_nonnegative_int(names: tuple[str, ...], default: int) -> int:
+    name, raw_value = _first_configured_env(names)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _env_nonnegative_float(names: tuple[str, ...], default: float) -> float:
+    name, raw_value = _first_configured_env(names)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite non-negative number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
+def _first_configured_env(names: tuple[str, ...]) -> tuple[str, str | None]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip() != "":
+            return name, value.strip()
+    return names[0], None
+
+
+def _env_bool(name: str | tuple[str, ...], *, default: bool) -> bool:
+    names = (name,) if isinstance(name, str) else name
+    configured_name, value = _first_configured_env(names)
+    if value is None:
+        return default
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{configured_name} must be a boolean") from None
 
 
 def _json_safe(value: Any) -> Any:

@@ -1,0 +1,21 @@
+# Development-only Track 2 direct-agent regression set.
+# These task IDs were persistent failures in two previous public Track 1 runs.
+
+[evaluator]
+endpoint = "http://127.0.0.1:8081"
+cmd = "python src/evaluator/server.py --host 127.0.0.1 --port 8081"
+
+[agent_under_test]
+endpoint = "http://127.0.0.1:8080"
+cmd = "python src/track_2_agent_under_test_cerebras/server.py --host 127.0.0.1 --port 8080"
+
+[config]
+num_trials = 1
+task_split = "test"
+tasks_base_num_tasks = -1
+tasks_base_task_id_filter = ["base_69", "base_97", "base_99"]
+tasks_hallucination_num_tasks = -1
+tasks_hallucination_task_id_filter = ["hallucination_37", "hallucination_45", "hallucination_67", "hallucination_83", "hallucination_96"]
+tasks_disambiguation_num_tasks = -1
+tasks_disambiguation_task_id_filter = ["disambiguation_27", "disambiguation_49"]
+max_steps = 50

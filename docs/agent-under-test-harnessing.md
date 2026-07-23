@@ -154,12 +154,13 @@ prefix to reuse when supported.
 During development, the Cerebras public tier can have strict rate limits. Use
 smoke scenarios first, keep completion-token caps tight, and schedule public
 validation runs instead of launching many at once. The reference client waits
-reactively only after Cerebras 429s, preferring
-`x-ratelimit-reset-tokens-minute` when present, writes JSON reports for those
-429s, and applies jittered local backoff for provider queue pressure. Organizers
-will provide increased Cerebras rate limits compared with a free personal
-account; access details will follow soon. Final quota-wait accounting details
-will be announced before the official evaluation.
+proactively when previous successful headers show the next estimated request
+exceeds the remaining token-minute quota. It also reacts to Cerebras 429s,
+preferring `x-ratelimit-reset-tokens-minute` when present, writes JSON reports
+for those 429s, and applies jittered local backoff for provider queue pressure.
+Organizers will provide increased Cerebras rate limits compared with a free
+personal account; access details will follow soon. Final quota-wait accounting
+details will be announced before the official evaluation.
 
 Track 2 uses inference-compute constraints: up to 5 sequential LLM calls for
 each baseline LLM step, with parallel calls inside a step allowed, and average

@@ -1,0 +1,45 @@
+name: Release checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Fetch pinned CAR-bench dependency
+        run: ./scripts/setup_car_bench.sh
+      - name: Install release dependencies
+        run: uv sync --frozen --extra track-2-agent --extra car-bench-evaluator
+      - name: Lint
+        run: uv run ruff check src tests scripts generate_compose.py
+      - name: Type-check PACT release closure
+        run: >-
+          uv run mypy --ignore-missing-imports
+          src/logging_utils.py src/tool_call_types.py src/turn_metrics.py
+          src/carbench_agent_core/__init__.py
+          src/carbench_agent_core/evidence_ledger.py
+          src/carbench_agent_core/obligation_runtime.py
+          src/carbench_agent_core/plan_ir.py
+          src/carbench_agent_core/plan_verifier.py
+          src/carbench_agent_core/response_renderer.py
+          src/carbench_agent_core/semantic_compiler.py
+          src/carbench_agent_core/tool_index.py
+          src/track_2_agent_under_test_cerebras/__init__.py
+          src/track_2_agent_under_test_cerebras/cerebras_client.py
+          src/track_2_agent_under_test_cerebras/pact_agent.py
+          src/track_2_agent_under_test_cerebras/plan_compiler_backend.py
+          src/track_2_agent_under_test_cerebras/server.py
+          generate_compose.py scripts/prepare_track2_submission.py
+      - name: Test
+        run: uv run pytest -q

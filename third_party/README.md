@@ -12,8 +12,11 @@ green evaluator image:
 ./scripts/setup_car_bench.sh
 ```
 
-The script clones CAR-bench into `third_party/car-bench/`. That directory is a
-local ignored dependency and can be deleted/recreated at any time.
+The script clones CAR-bench into `third_party/car-bench/` at the pinned,
+release-validated commit `6bc1900750e561e79831dd6a8e757ac37080ba0f`. That
+directory is a local ignored dependency and can be deleted/recreated at any
+time. To intentionally test another upstream revision, set `CAR_BENCH_REF` to
+the desired commit SHA before invoking the script.
 
 The green evaluator imports CAR-bench from this path. Purple reference agents do
 not need the CAR-bench checkout at runtime.

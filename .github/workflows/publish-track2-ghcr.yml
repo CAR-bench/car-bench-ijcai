@@ -1,0 +1,107 @@
+name: Publish PACT Track 2 Release Candidate to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable PACT release tag (for example, track2-pact-rc1)"
+        required: true
+        default: "track2-pact-rc1"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Fetch pinned CAR-bench dependency
+        run: ./scripts/setup_car_bench.sh
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Verify release candidate
+        run: |
+          uv sync --frozen --extra track-2-agent --extra car-bench-evaluator
+          uv run ruff check src tests scripts generate_compose.py
+          uv run mypy --ignore-missing-imports \
+            src/logging_utils.py src/tool_call_types.py src/turn_metrics.py \
+            src/carbench_agent_core/__init__.py \
+            src/carbench_agent_core/evidence_ledger.py \
+            src/carbench_agent_core/obligation_runtime.py \
+            src/carbench_agent_core/plan_ir.py \
+            src/carbench_agent_core/plan_verifier.py \
+            src/carbench_agent_core/response_renderer.py \
+            src/carbench_agent_core/semantic_compiler.py \
+            src/carbench_agent_core/tool_index.py \
+            src/track_2_agent_under_test_cerebras/__init__.py \
+            src/track_2_agent_under_test_cerebras/cerebras_client.py \
+            src/track_2_agent_under_test_cerebras/pact_agent.py \
+            src/track_2_agent_under_test_cerebras/plan_compiler_backend.py \
+            src/track_2_agent_under_test_cerebras/server.py \
+            generate_compose.py scripts/prepare_track2_submission.py
+          uv run pytest -q
+
+      # The former planner/executor variant is archived and intentionally has
+      # no publish path. The final Track 2 submission is PACT only.
+      - name: Configure PACT release
+        id: config
+        shell: bash
+        run: |
+          echo "dockerfile=src/track_2_agent_under_test_cerebras/Dockerfile.track-2-agent-under-test-cerebras" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository_owner }}/car-bench-track-2-direct" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.config.outputs.image }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=sha,format=long
+
+      - name: Build and push linux/amd64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.config.outputs.dockerfile }}
+          platforms: linux/amd64
+          # Keep the submitted reference a single-platform image manifest.
+          # A default provenance attachment adds an unknown/unknown descriptor
+          # to the OCI index, which can confuse strict platform validators.
+          provenance: false
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record immutable submission reference
+        shell: bash
+        run: |
+          {
+            echo "## Track 2 image published"
+            echo
+            echo "- Agent: \`PACT Track 2 direct Cerebras\`"
+            echo "- Image: \`${{ steps.config.outputs.image }}@${{ steps.build.outputs.digest }}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo
+            echo "Set the GHCR package visibility to **Public**, then use this exact digest with \`scripts/prepare_track2_submission.py\`."
+          } >> "$GITHUB_STEP_SUMMARY"

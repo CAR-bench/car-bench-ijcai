@@ -7,7 +7,7 @@ env = { GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}", LOGURU
 
 [agent_under_test]
 image = "ghcr.io/yourusername/car-bench-track-1-agent-under-test:latest"
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}", OPENAI_API_KEY = "${OPENAI_API_KEY:-}", GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}", AGENT_LLM = "${AGENT_LLM:-gemini/gemini-2.5-flash}", AGENT_TEMPERATURE = "${AGENT_TEMPERATURE:-0.0}", LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}" }
+env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}", OPENAI_API_KEY = "${OPENAI_API_KEY:-}", OPENROUTER_API_KEY = "${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in .env}", GEMINI_API_KEY = "${GEMINI_API_KEY:-}", AGENT_LLM = "${AGENT_LLM:-openrouter/openai/gpt-oss-120b:free}", AGENT_TEMPERATURE = "${AGENT_TEMPERATURE:-0.0}", LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}" }
 
 [config]
 num_trials = 3

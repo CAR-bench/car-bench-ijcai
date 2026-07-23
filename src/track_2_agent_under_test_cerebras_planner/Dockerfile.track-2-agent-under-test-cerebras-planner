@@ -1,20 +1,22 @@
-FROM ghcr.io/astral-sh/uv:python3.12-trixie AS python-deps
+FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim@sha256:3137a0b606f65a74ee0245f43dae219b09e8af98fc37fef20841cbceef35a646 AS python-deps
 
-RUN adduser carbench
+RUN adduser --disabled-password --gecos "" carbench
 USER carbench
 RUN mkdir -p /home/carbench/.cache/uv
 WORKDIR /home/carbench/app
 
 COPY --chown=carbench:carbench pyproject.toml uv.lock README.md ./
-COPY --chown=carbench:carbench third_party third_party
 
 RUN \
     --mount=type=cache,target=/home/carbench/.cache/uv,uid=1000 \
-    uv sync --no-install-project --no-dev --extra track-2-agent --extra car-bench-evaluator
+    uv sync --frozen --no-install-project --no-dev --extra track-2-agent
 
-FROM ghcr.io/astral-sh/uv:python3.12-trixie
+FROM python:3.12-slim-trixie@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
-RUN adduser carbench
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos "" carbench
 USER carbench
 WORKDIR /home/carbench/app
 

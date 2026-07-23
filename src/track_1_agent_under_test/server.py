@@ -1,5 +1,6 @@
 """Server entry point for CAR-bench agent under test."""
 import argparse
+import os
 import sys
 from pathlib import Path
 import warnings
@@ -28,6 +29,13 @@ from logging_utils import configure_logger
 sys.path.pop(0)
 
 logger = configure_logger(role="agent_under_test", context="server")
+
+
+def _env_float(name: str, default: float | None = None) -> float | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
 
 
 def prepare_agent_card(url: str) -> AgentCard:
@@ -80,10 +88,13 @@ def main():
 
     # Support both command-line args and environment variables
     # Priority: CLI args > env vars > default
-    import os
     agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "gemini/gemini-2.5-flash")
     completion_kwargs = {
-        "temperature": args.temperature or os.getenv("AGENT_TEMPERATURE", None),
+        "temperature": (
+            args.temperature
+            if args.temperature is not None
+            else _env_float("AGENT_TEMPERATURE")
+        ),
         "thinking": args.thinking or (os.getenv("AGENT_THINKING", "false").lower() == "true"),
         "reasoning_effort": args.reasoning_effort or os.getenv("AGENT_REASONING_EFFORT", "medium"),
         "interleaved_thinking": args.interleaved_thinking or (os.getenv("AGENT_INTERLEAVED_THINKING", "false").lower() == "true"),

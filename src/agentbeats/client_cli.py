@@ -252,6 +252,8 @@ def _agent_metadata(data: dict[str, Any]) -> dict[str, Any]:
                 "CODEX_EXECUTOR_MODEL",
                 "CODEX_PLANNER_REASONING_EFFORT",
                 "CODEX_EXECUTOR_REASONING_EFFORT",
+                "PACT_COMPILER_MODEL",
+                "PACT_COMPILER_REASONING_EFFORT",
                 "TRACK2_PLANNER_MODEL",
                 "TRACK2_EXECUTOR_MODEL",
                 "TRACK2_PLANNER_REASONING_EFFORT",
@@ -292,6 +294,10 @@ def _model_label(metadata: dict[str, Any]) -> str | None:
     if metadata.get("result_model"):
         return _normalize_label(metadata["result_model"])
 
+    pact_model = _normalize_label(metadata.get("PACT_COMPILER_MODEL"))
+    if pact_model:
+        return pact_model
+
     planner = _normalize_label(metadata.get("CODEX_PLANNER_MODEL"))
     executor = _normalize_label(metadata.get("CODEX_EXECUTOR_MODEL"))
     if planner and executor:
@@ -323,6 +329,10 @@ def _model_label(metadata: dict[str, Any]) -> str | None:
 def _reasoning_label(metadata: dict[str, Any]) -> str | None:
     if metadata.get("result_reasoning_effort"):
         return _normalize_label(metadata["result_reasoning_effort"])
+
+    pact_effort = _normalize_label(metadata.get("PACT_COMPILER_REASONING_EFFORT"))
+    if pact_effort:
+        return pact_effort
 
     planner = _normalize_label(metadata.get("CODEX_PLANNER_REASONING_EFFORT"))
     executor = _normalize_label(metadata.get("CODEX_EXECUTOR_REASONING_EFFORT"))

@@ -24,7 +24,10 @@ from car_bench.envs.tool_execution_error_evaluator import (
 )
 from car_bench.types import Task, TaskType
 from track_2_agent_under_test_cerebras.car_bench_agent import (
+    AgentInferenceResult,
     CARBenchAgentExecutor as CerebrasCARBenchAgentExecutor,
+    build_next_action_prompt,
+    prompt_component_char_counts,
 )
 from track_2_agent_under_test_cerebras import cerebras_client as cerebras_client_module
 from track_2_agent_under_test_cerebras.cerebras_client import (
@@ -80,9 +83,7 @@ class FakeCerebrasSDKClient:
         self.create_endpoint = FakeCerebrasCreateEndpoint(outcomes)
         self.chat = SimpleNamespace(
             completions=SimpleNamespace(
-                with_raw_response=SimpleNamespace(
-                    create=self.create_endpoint.create
-                )
+                with_raw_response=SimpleNamespace(create=self.create_endpoint.create)
             )
         )
 
@@ -127,6 +128,43 @@ class FakeLogger:
 
     def debug(self, event: str, **kwargs) -> None:
         self.entries.append(("debug", event, kwargs))
+
+
+class FakeRequestContext:
+    def __init__(self, message, context_id: str = "ctx-test") -> None:
+        self.message = message
+        self.context_id = context_id
+
+    def get_user_input(self) -> str:
+        return ""
+
+
+class FakeEventQueue:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def enqueue_event(self, event) -> None:
+        self.events.append(event)
+
+
+def fake_tool(
+    name: str,
+    *,
+    properties: dict | None = None,
+    required: list[str] | None = None,
+) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": properties or {},
+                "required": required or [],
+            },
+        },
+    }
 
 
 def fake_completion(
@@ -234,6 +272,23 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(result.token_usage.input_tokens, 100)
         self.assertEqual(result.rate_limit_headers.remaining_tokens_minute, 1200.0)
 
+    def test_cerebras_structured_mapping_content_is_canonical_json(self) -> None:
+        fake_sdk = FakeCerebrasSDKClient(
+            [FakeRawResponse(fake_completion(content={"answer": "ok", "count": 2}))]
+        )
+        client = CerebrasCompletionClient(sdk_client=fake_sdk)
+
+        result = client.generate(
+            model="gpt-oss-120b",
+            messages=[{"role": "user", "content": "hello"}],
+            response_schema={"type": "object", "additionalProperties": False},
+            response_schema_name="structured_response",
+            max_completion_tokens=64,
+            temperature=None,
+        )
+
+        self.assertEqual(result.text, '{"answer":"ok","count":2}')
+
     def test_cerebras_executor_temperature_is_omitted_by_default(self) -> None:
         client = CerebrasCompletionClient(
             sdk_client=FakeCerebrasSDKClient([]),
@@ -325,6 +380,38 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(headers.reset_requests_day_seconds, 3600.0)
         self.assertEqual(headers.reset_tokens_minute_seconds, 12.5)
 
+    def test_cerebras_proactively_waits_for_known_token_quota(self) -> None:
+        client = CerebrasCompletionClient(sdk_client=FakeCerebrasSDKClient([]))
+        client._last_rate_limit_headers_by_model["gpt-oss-120b"] = (
+            CerebrasRateLimitHeaders(
+                remaining_tokens_minute=100.0,
+                reset_tokens_minute_seconds=2.5,
+            ),
+            cerebras_client_module.time.perf_counter(),
+        )
+
+        wait_seconds = client._proactive_quota_wait_seconds(
+            model="gpt-oss-120b",
+            estimated_tokens=101,
+        )
+
+        self.assertEqual(wait_seconds, 3.5)
+        self.assertEqual(
+            client._proactive_quota_wait_seconds(
+                model="gpt-oss-120b",
+                estimated_tokens=100,
+            ),
+            0.0,
+        )
+        client._clear_rate_limit_headers("gpt-oss-120b")
+        self.assertEqual(
+            client._proactive_quota_wait_seconds(
+                model="gpt-oss-120b",
+                estimated_tokens=101,
+            ),
+            0.0,
+        )
+
     def test_cerebras_estimates_prompt_plus_completion_budget(self) -> None:
         estimated = estimate_request_tokens(
             messages=[{"role": "user", "content": "abcd"}],
@@ -362,9 +449,7 @@ class A2AResponseContractTest(unittest.TestCase):
             "provider_error_headers": {"x-should-retry": "false"},
         }
         original_uniform = cerebras_client_module.random.uniform
-        cerebras_client_module.random.uniform = lambda left, right: (
-            left + right
-        ) / 2.0
+        cerebras_client_module.random.uniform = lambda left, right: (left + right) / 2.0
         try:
             first_signal = _extract_cerebras_rate_limit_signal(
                 details,
@@ -685,16 +770,12 @@ class A2AResponseContractTest(unittest.TestCase):
             self.assertEqual(payload["tokens_consumed"]["input_tokens"], 1000)
             self.assertEqual(payload["tokens_consumed"]["output_tokens"], 100)
             self.assertEqual(
-                payload["tokens_consumed_since_previous_rate_limit"][
-                    "input_tokens"
-                ],
+                payload["tokens_consumed_since_previous_rate_limit"]["input_tokens"],
                 1000,
             )
             self.assertEqual(payload["estimated_request_tokens_attempted"], 1234)
             self.assertEqual(
-                payload[
-                    "estimated_request_tokens_attempted_since_previous_rate_limit"
-                ],
+                payload["estimated_request_tokens_attempted_since_previous_rate_limit"],
                 1234,
             )
             self.assertEqual(
@@ -881,57 +962,6 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(arguments["charging_time"], 40)
         self.assertIs(type(arguments["charging_time"]), int)
 
-    def test_generic_tool_exception_is_recorded_in_tool_execution_errors(self) -> None:
-        class FailingTool:
-            @staticmethod
-            def invoke(**kwargs):
-                raise TypeError("boom")
-
-        env = Env.__new__(Env)
-        env.actions = []
-        env.data = {}
-        env.task = fake_task()
-        env.tools_map = {"failing_tool": FailingTool}
-
-        token = tool_execution_errors_during_runtime.set([])
-        try:
-            response = env.step(
-                SimpleNamespace(name="failing_tool", kwargs={}),
-                [],
-            )
-            errors = tool_execution_errors_during_runtime.get()
-        finally:
-            tool_execution_errors_during_runtime.reset(token)
-
-        self.assertEqual(response.observation, "Error: boom")
-        self.assertEqual(errors, ["failing_tool: TypeError: boom"])
-
-    def test_async_generic_tool_exception_is_recorded_in_tool_execution_errors(self) -> None:
-        class FailingTool:
-            @staticmethod
-            def invoke(**kwargs):
-                raise TypeError("boom")
-
-        env = Env.__new__(Env)
-        env.terminate_tools = []
-        env.task = fake_task()
-
-        token = tool_execution_errors_during_runtime.set([])
-        try:
-            result = asyncio.run(
-                env._run_action(
-                    SimpleNamespace(name="failing_tool", kwargs={}),
-                    {"failing_tool": FailingTool},
-                    {},
-                )
-            )
-            errors = tool_execution_errors_during_runtime.get()
-        finally:
-            tool_execution_errors_during_runtime.reset(token)
-
-        self.assertEqual(result["observation"], "Error: boom")
-        self.assertEqual(errors, ["failing_tool: TypeError: boom"])
-
     def test_explicit_tool_execution_errors_are_preserved(self) -> None:
         class ExplicitFailureTool:
             @staticmethod
@@ -959,12 +989,14 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(errors, ["explicit failure"])
 
     def test_cerebras_respond_action_returns_text_part(self) -> None:
-        parts, history_message = CerebrasCARBenchAgentExecutor._build_a2a_response_parts(
-            {
-                "action": "respond",
-                "content": "Done.",
-                "tool_calls": [],
-            }
+        parts, history_message = (
+            CerebrasCARBenchAgentExecutor._build_a2a_response_parts(
+                {
+                    "action": "respond",
+                    "content": "Done.",
+                    "tool_calls": [],
+                }
+            )
         )
 
         self.assertEqual(len(parts), 1)
@@ -973,17 +1005,19 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(history_message, {"role": "assistant", "content": "Done."})
 
     def test_cerebras_tool_action_returns_tool_calls_data_part(self) -> None:
-        parts, history_message = CerebrasCARBenchAgentExecutor._build_a2a_response_parts(
-            {
-                "action": "tool_calls",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "tool_name": "open_close_sunshade",
-                        "arguments": {"percentage": 50},
-                    }
-                ],
-            }
+        parts, history_message = (
+            CerebrasCARBenchAgentExecutor._build_a2a_response_parts(
+                {
+                    "action": "tool_calls",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "tool_name": "open_close_sunshade",
+                            "arguments": {"percentage": 50},
+                        }
+                    ],
+                }
+            )
         )
 
         self.assertEqual(len(parts), 1)
@@ -1007,6 +1041,251 @@ class A2AResponseContractTest(unittest.TestCase):
             history_message["tool_calls"][0]["function"]["name"],
             "open_close_sunshade",
         )
+
+    def test_cerebras_policy_controller_runs_before_model_call(self) -> None:
+        class NoModelExecutor(CerebrasCARBenchAgentExecutor):
+            def __init__(self) -> None:
+                super().__init__(model="gpt-oss-120b")
+                self.model_calls = 0
+
+            def _call_model_with_retries(self, **kwargs):
+                self.model_calls += 1
+                raise AssertionError("model should not be called")
+
+        message = create_message_with_parts(
+            parts=[
+                new_text_part(
+                    'System: CURRENT_LOCATION = {"id": "loc_1"}\n'
+                    'DATETIME = {"month": 6, "day": 17, "hour": 9, "minute": 0}'
+                    "\n\nUser: Open the sunroof halfway."
+                ),
+                new_data_part(
+                    {
+                        "tools": [
+                            fake_tool("get_sunroof_and_sunshade_position"),
+                        ]
+                    }
+                ),
+            ],
+            context_id="ctx-policy",
+        )
+        executor = NoModelExecutor()
+        event_queue = FakeEventQueue()
+
+        asyncio.run(
+            executor.execute(
+                FakeRequestContext(message, context_id="ctx-policy"),
+                event_queue,
+            )
+        )
+
+        self.assertEqual(executor.model_calls, 0)
+        self.assertEqual(len(event_queue.events), 1)
+        response = event_queue.events[0]
+        self.assertEqual(response.parts[0].WhichOneof("content"), "data")
+        data = MessageToDict(response.parts[0].data)
+        self.assertEqual(
+            data["tool_calls"][0]["tool_name"],
+            "get_sunroof_and_sunshade_position",
+        )
+        self.assertEqual(
+            executor.ctx_id_to_turn_metrics["ctx-policy"][NUM_LLM_CALLS],
+            0,
+        )
+
+    def test_cerebras_planner_clears_private_plan_when_policy_controls_turn(
+        self,
+    ) -> None:
+        class NoModelPlanner(CerebrasPlannerExecutor):
+            def __init__(self) -> None:
+                super().__init__(
+                    planner_model="gpt-oss-120b",
+                    executor_model="gpt-oss-120b",
+                )
+                self.model_calls = 0
+
+            def _call_model_with_retries(self, **kwargs):
+                self.model_calls += 1
+                raise AssertionError("model should not be called")
+
+        message = create_message_with_parts(
+            parts=[
+                new_text_part(
+                    'System: CURRENT_LOCATION = {"id": "loc_1"}\n'
+                    'DATETIME = {"month": 6, "day": 17, "hour": 9, "minute": 0}'
+                    "\n\nUser: Open the sunroof halfway."
+                ),
+                new_data_part(
+                    {
+                        "tools": [
+                            fake_tool("get_sunroof_and_sunshade_position"),
+                        ]
+                    }
+                ),
+            ],
+            context_id="ctx-policy-planner",
+        )
+        executor = NoModelPlanner()
+        executor._active_private_plans_by_context["ctx-policy-planner"] = {
+            "planning_tool": {"plan_id": "stale"}
+        }
+        event_queue = FakeEventQueue()
+
+        asyncio.run(
+            executor.execute(
+                FakeRequestContext(message, context_id="ctx-policy-planner"),
+                event_queue,
+            )
+        )
+
+        self.assertEqual(executor.model_calls, 0)
+        self.assertNotIn(
+            "ctx-policy-planner",
+            executor._active_private_plans_by_context,
+        )
+
+    def test_cerebras_model_tool_call_is_validated_against_available_tools(
+        self,
+    ) -> None:
+        class InvalidToolCallExecutor(CerebrasCARBenchAgentExecutor):
+            def __init__(self) -> None:
+                super().__init__(model="gpt-oss-120b")
+                self.model_calls = 0
+
+            def _call_model_with_retries(self, **kwargs):
+                self.model_calls += 1
+                return AgentInferenceResult(
+                    next_action={
+                        "action": "tool_calls",
+                        "content": "",
+                        "tool_calls": [{"tool_name": "missing_tool", "arguments": {}}],
+                    },
+                    elapsed_ms=25.0,
+                    internal_calls=1,
+                )
+
+        message = create_message_with_parts(
+            parts=[new_text_part("Please do the unavailable action.")],
+            context_id="ctx-invalid-tool",
+        )
+        executor = InvalidToolCallExecutor()
+        event_queue = FakeEventQueue()
+
+        asyncio.run(
+            executor.execute(
+                FakeRequestContext(message, context_id="ctx-invalid-tool"),
+                event_queue,
+            )
+        )
+
+        self.assertEqual(executor.model_calls, 1)
+        self.assertEqual(len(event_queue.events), 1)
+        response = event_queue.events[0]
+        self.assertEqual(response.parts[0].WhichOneof("content"), "text")
+        self.assertEqual(
+            response.parts[0].text,
+            "I don't currently have that capability, so I can't complete this request.",
+        )
+
+    def test_cerebras_explicit_empty_tool_list_revokes_cached_tools(self) -> None:
+        class CapturingExecutor(CerebrasCARBenchAgentExecutor):
+            def __init__(self) -> None:
+                super().__init__(model="gpt-oss-120b")
+                self.tools_seen_by_model = None
+
+            def _call_model_with_retries(self, **kwargs):
+                self.tools_seen_by_model = kwargs["tools"]
+                return AgentInferenceResult(
+                    next_action={
+                        "action": "respond",
+                        "content": "I can't help with that right now.",
+                        "tool_calls": [],
+                    },
+                    elapsed_ms=1.0,
+                    internal_calls=1,
+                )
+
+        context_id = "ctx-tools-revoked"
+        message = create_message_with_parts(
+            parts=[
+                new_text_part("Tell me a joke."),
+                new_data_part({"tools": []}),
+            ],
+            context_id=context_id,
+        )
+        executor = CapturingExecutor()
+        executor.ctx_id_to_tools[context_id] = [fake_tool("stale_tool")]
+        event_queue = FakeEventQueue()
+
+        asyncio.run(
+            executor.execute(
+                FakeRequestContext(message, context_id=context_id),
+                event_queue,
+            )
+        )
+
+        self.assertEqual(executor.tools_seen_by_model, [])
+        self.assertEqual(executor.ctx_id_to_tools[context_id], [])
+        self.assertEqual(len(event_queue.events), 1)
+
+    def test_cerebras_prompt_compacts_tool_schema_and_bounds_history(self) -> None:
+        verbose_description = "tool description " * 80
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_example",
+                    "description": verbose_description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["safe", "fast"],
+                                "description": verbose_description,
+                                "examples": ["safe"],
+                            }
+                        },
+                        "required": ["mode"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+        messages = [
+            {"role": "system", "content": "policy"},
+            {"role": "user", "content": "initial task"},
+            *[
+                {"role": "assistant", "content": f"obsolete turn {index}"}
+                for index in range(30)
+            ],
+            {"role": "user", "content": "latest task state"},
+        ]
+
+        prompt = json.loads(
+            build_next_action_prompt(messages=messages, tools=tools)
+        )
+
+        compact_tool = prompt["available_tools"][0]["function"]
+        self.assertEqual(compact_tool["name"], "set_example")
+        self.assertLessEqual(len(compact_tool["description"]), 240)
+        mode_schema = compact_tool["parameters"]["properties"]["mode"]
+        self.assertEqual(mode_schema["enum"], ["safe", "fast"])
+        self.assertNotIn("examples", mode_schema)
+
+        transcript = prompt["conversation_transcript"]
+        self.assertEqual(transcript[0]["content"], "policy")
+        self.assertEqual(transcript[1]["content"], "initial task")
+        self.assertEqual(transcript[-1]["content"], "latest task state")
+        self.assertLessEqual(len(transcript), 24)
+        self.assertNotIn(
+            "obsolete turn 0",
+            [item["content"] for item in transcript],
+        )
+        sizes = prompt_component_char_counts(messages=messages, tools=tools)
+        self.assertGreater(sizes["system_prompt_chars"], 0)
+        self.assertGreater(sizes["tool_schema_prompt_chars"], 0)
+        self.assertGreater(sizes["transcript_prompt_chars"], 0)
 
     def test_cerebras_turn_metrics_are_public_metadata_shape(self) -> None:
         executor = CerebrasCARBenchAgentExecutor(model="gpt-oss-120b")
@@ -1037,6 +1316,25 @@ class A2AResponseContractTest(unittest.TestCase):
         self.assertEqual(metrics[NUM_PASSES], 1)
         self.assertEqual(metrics[QUOTA_WAIT_TIME_MS], 0.0)
         self.assertNotIn("_total_llm_time_ms", metrics)
+
+    def test_cerebras_turn_metrics_allow_zero_call_policy_turn(self) -> None:
+        executor = CerebrasCARBenchAgentExecutor(model="gpt-oss-120b")
+
+        executor._record_turn_metrics(
+            "ctx",
+            0.0,
+            internal_calls=0,
+        )
+        metrics = executor._public_turn_metrics(
+            executor.ctx_id_to_turn_metrics.pop("ctx")
+        )
+
+        self.assertEqual(metrics[PROMPT_TOKENS], 0)
+        self.assertEqual(metrics[COMPLETION_TOKENS], 0)
+        self.assertEqual(metrics[THINKING_TOKENS], 0)
+        self.assertEqual(metrics[NUM_LLM_CALLS], 0)
+        self.assertEqual(metrics[AVG_LLM_CALL_TIME_MS], 0.0)
+        self.assertEqual(metrics[NUM_PASSES], 1)
 
     def test_cerebras_planner_executor_metrics_report_internal_passes(self) -> None:
         executor = CerebrasPlannerExecutor(

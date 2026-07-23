@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,13 @@ from a2a.types import Role
 from google.protobuf.json_format import MessageToDict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from carbench_agent_core import NextAction, PolicyAwareController, ToolIndex
+from carbench_agent_core.response_renderer import (
+    clean_user_content as _clean_user_content,
+    render_malformed_action,
+    render_malformed_tool_arguments,
+    render_malformed_tool_call,
+)
 from logging_utils import configure_logger
 from tool_call_types import ToolCall, ToolCallsData
 from turn_metrics import (
@@ -30,6 +39,7 @@ from turn_metrics import (
     THINKING_TOKENS,
     TURN_METRICS_KEY,
 )
+
 sys.path.pop(0)
 
 if __package__:
@@ -57,6 +67,84 @@ else:
 
 
 logger = configure_logger(role="agent_under_test", context="-")
+
+
+def _payload_from_next_action(action: NextAction) -> dict[str, Any]:
+    if action.action == "respond":
+        return {"action": "respond", "content": action.content, "tool_calls": []}
+    return {
+        "action": "tool_calls",
+        "content": "",
+        "tool_calls": [
+            {
+                "tool_name": tool_call["tool_name"],
+                "arguments": tool_call.get("arguments") or {},
+            }
+            for tool_call in action.tool_calls
+        ],
+    }
+
+
+def _validated_next_action(
+    next_action: dict[str, Any],
+    *,
+    tool_index: ToolIndex,
+) -> dict[str, Any]:
+    if next_action.get("action") == "respond":
+        return {
+            "action": "respond",
+            "content": _clean_user_content(next_action.get("content") or ""),
+            "tool_calls": [],
+        }
+
+    if next_action.get("action") != "tool_calls":
+        return {
+            "action": "respond",
+            "content": render_malformed_action(),
+            "tool_calls": [],
+        }
+
+    tool_calls = next_action.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return {
+            "action": "respond",
+            "content": render_malformed_tool_call(),
+            "tool_calls": [],
+        }
+
+    validated_calls = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            return {
+                "action": "respond",
+                "content": render_malformed_tool_call(),
+                "tool_calls": [],
+            }
+        name = tool_call.get("tool_name")
+        arguments = tool_call.get("arguments") or {}
+        if not isinstance(name, str) or not name:
+            return {
+                "action": "respond",
+                "content": render_malformed_tool_call(),
+                "tool_calls": [],
+            }
+        if not isinstance(arguments, dict):
+            return {
+                "action": "respond",
+                "content": render_malformed_tool_arguments(),
+                "tool_calls": [],
+            }
+
+        validation_error = tool_index.validate_call(name, arguments)
+        if validation_error:
+            return {
+                "action": "respond",
+                "content": validation_error,
+                "tool_calls": [],
+            }
+        validated_calls.append({"tool_name": name, "arguments": arguments})
+
+    return {"action": "tool_calls", "content": "", "tool_calls": validated_calls}
 
 
 @dataclass
@@ -98,6 +186,7 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.ctx_id_to_messages: dict[str, list[dict[str, Any]]] = {}
         self.ctx_id_to_tools: dict[str, list[dict[str, Any]]] = {}
         self.ctx_id_to_turn_metrics: dict[str, dict[str, Any]] = {}
+        self.policy_controller = PolicyAwareController()
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         inbound_message = context.message
@@ -118,7 +207,8 @@ class CARBenchAgentExecutor(AgentExecutor):
                 context,
                 messages,
             )
-            if tools_from_msg := self._extract_tools(inbound_message):
+            tools_from_msg = self._extract_tools(inbound_message)
+            if tools_from_msg is not None:
                 tools = tools_from_msg
                 self.ctx_id_to_tools[context.context_id] = tools
 
@@ -143,12 +233,54 @@ class CARBenchAgentExecutor(AgentExecutor):
                 incoming_tool_results=incoming_tool_results,
             )
 
-            inference_result = self._call_model_with_retries(
+            tool_index = ToolIndex(tools)
+            controlled_action = self.policy_controller.decide(
                 context_id=context.context_id,
                 messages=messages,
                 tools=tools,
-                ctx_logger=ctx_logger,
+                latest_user_text=(
+                    user_message_text if not incoming_tool_results else None
+                ),
+                latest_tool_results=incoming_tool_results,
             )
+
+            if controlled_action is not None:
+                inference_result = AgentInferenceResult(
+                    next_action=_validated_next_action(
+                        _payload_from_next_action(controlled_action),
+                        tool_index=tool_index,
+                    ),
+                    elapsed_ms=0.0,
+                    token_usage=None,
+                    cost=0.0,
+                    internal_calls=0,
+                    quota_wait_ms=0.0,
+                )
+                ctx_logger.info(
+                    "Policy controller selected action",
+                    action=controlled_action.action,
+                    reason=controlled_action.reason,
+                    num_tool_calls=len(controlled_action.tool_calls),
+                    pending_obligations=self.policy_controller.pending_obligations(
+                        context.context_id
+                    ),
+                )
+                self._on_policy_controlled_action(
+                    context.context_id,
+                    controlled_action,
+                )
+            else:
+                inference_result = await asyncio.to_thread(
+                    self._call_model_with_retries,
+                    context_id=context.context_id,
+                    messages=messages,
+                    tools=tools,
+                    ctx_logger=ctx_logger,
+                )
+                inference_result.next_action = _validated_next_action(
+                    inference_result.next_action,
+                    tool_index=tool_index,
+                )
 
             parts, assistant_message_for_history = self._build_a2a_response_parts(
                 inference_result.next_action
@@ -170,10 +302,7 @@ class CARBenchAgentExecutor(AgentExecutor):
             )
 
             has_tool_calls = bool(assistant_message_for_history.get("tool_calls"))
-            if (
-                not has_tool_calls
-                and context.context_id in self.ctx_id_to_turn_metrics
-            ):
+            if not has_tool_calls and context.context_id in self.ctx_id_to_turn_metrics:
                 metrics = self._public_turn_metrics(
                     self.ctx_id_to_turn_metrics.pop(context.context_id)
                 )
@@ -184,7 +313,11 @@ class CARBenchAgentExecutor(AgentExecutor):
         except Exception as exc:
             ctx_logger.error("Cerebras agent error", error=str(exc), exc_info=True)
             response_message = new_message(
-                parts=[new_text_part(f"Error processing request: {str(exc)}")],
+                parts=[
+                    new_text_part(
+                        "I'm sorry, I couldn't process that request safely."
+                    )
+                ],
                 context_id=context.context_id,
                 role=Role.ROLE_AGENT,
             )
@@ -198,6 +331,7 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.ctx_id_to_messages.pop(context.context_id, None)
         self.ctx_id_to_tools.pop(context.context_id, None)
         self.ctx_id_to_turn_metrics.pop(context.context_id, None)
+        self.policy_controller.reset(context.context_id)
 
     def _call_model_with_retries(
         self,
@@ -221,6 +355,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 tools=tools,
                 correction=correction,
             )
+            prompt_sizes = prompt_component_char_counts(messages=messages, tools=tools)
             ctx_logger.debug(
                 "Calling Cerebras executor",
                 attempt=attempt + 1,
@@ -228,6 +363,9 @@ class CARBenchAgentExecutor(AgentExecutor):
                 num_messages=len(messages),
                 num_tools=len(tools),
                 prompt_chars=len(prompt),
+                system_prompt_chars=prompt_sizes["system_prompt_chars"],
+                tool_schema_prompt_chars=prompt_sizes["tool_schema_prompt_chars"],
+                transcript_prompt_chars=prompt_sizes["transcript_prompt_chars"],
                 max_completion_tokens=self.max_completion_tokens,
                 reasoning_effort=self.reasoning_effort,
                 tool_names=[
@@ -323,6 +461,14 @@ class CARBenchAgentExecutor(AgentExecutor):
             f"Cerebras did not produce a valid next-action JSON object: {last_error}"
         )
 
+    def _on_policy_controlled_action(
+        self,
+        context_id: str,
+        controlled_action: NextAction,
+    ) -> None:
+        """Hook for subclasses that keep model-side per-context state."""
+        return None
+
     def _parse_inbound_parts(
         self,
         inbound_message,
@@ -371,9 +517,11 @@ class CARBenchAgentExecutor(AgentExecutor):
         user_message_text: str | None,
         incoming_tool_results: list[dict[str, Any]] | None,
     ) -> None:
-        if messages and messages[-1].get("role") == "assistant" and messages[
-            -1
-        ].get("tool_calls"):
+        if (
+            messages
+            and messages[-1].get("role") == "assistant"
+            and messages[-1].get("tool_calls")
+        ):
             prev_tool_calls = messages[-1]["tool_calls"]
             tool_results = _format_tool_results(
                 prev_tool_calls=prev_tool_calls,
@@ -412,11 +560,7 @@ class CARBenchAgentExecutor(AgentExecutor):
             )
             tool_calls_data.append(ToolCall(tool_name=name, arguments=arguments))
 
-        parts = [
-            new_data_part(
-                ToolCallsData(tool_calls=tool_calls_data).model_dump()
-            )
-        ]
+        parts = [new_data_part(ToolCallsData(tool_calls=tool_calls_data).model_dump())]
         return parts, {
             "role": "assistant",
             "content": None,
@@ -442,11 +586,13 @@ class CARBenchAgentExecutor(AgentExecutor):
                 MODEL: self.model,
                 THINKING_TOKENS: 0,
                 NUM_LLM_CALLS: 0,
+                NUM_PASSES: 1,
                 QUOTA_WAIT_TIME_MS: 0.0,
                 "_total_llm_time_ms": 0.0,
             },
         )
-        metrics[NUM_LLM_CALLS] += max(internal_calls, 1)
+        internal_calls = max(internal_calls, 0)
+        metrics[NUM_LLM_CALLS] += internal_calls
         if token_usage is not None:
             metrics[PROMPT_TOKENS] += token_usage.input_tokens
             metrics[COMPLETION_TOKENS] += token_usage.output_tokens
@@ -455,11 +601,10 @@ class CARBenchAgentExecutor(AgentExecutor):
         metrics["_total_llm_time_ms"] += elapsed_ms
         metrics[QUOTA_WAIT_TIME_MS] += quota_wait_ms
         num_calls = metrics[NUM_LLM_CALLS]
-        metrics[AVG_LLM_CALL_TIME_MS] = round(
-            metrics["_total_llm_time_ms"] / num_calls,
-            1,
+        metrics[AVG_LLM_CALL_TIME_MS] = (
+            round(metrics["_total_llm_time_ms"] / num_calls, 1) if num_calls else 0.0
         )
-        metrics[NUM_PASSES] = max(internal_calls, 1)
+        metrics[NUM_PASSES] = max(metrics.get(NUM_PASSES, 1), max(internal_calls, 1))
 
     @staticmethod
     def _public_turn_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -522,7 +667,7 @@ def build_next_action_prompt(
 ) -> str:
     prompt = {
         "task": "Choose exactly one next assistant action for this CAR-bench turn.",
-        "available_tools": tools,
+        "available_tools": compact_tools_for_prompt(tools),
         "conversation_transcript": _messages_for_prompt(messages),
         "output_contract": {
             "respond": "Use when speaking naturally to the user.",
@@ -532,6 +677,15 @@ def build_next_action_prompt(
             "Use only the tool definitions in available_tools.",
             "Do not invent tool observations.",
             "If a capability or parameter is unavailable, respond to the user transparently.",
+            "If choosing tool_calls, keep content empty and do not explain the tool call.",
+            "If asking the user, ask exactly one concrete question.",
+            (
+                "Before responding, verify that every requested subtask and required "
+                "confirmation is complete; otherwise continue with the next tool call "
+                "or one clarifying question."
+            ),
+            "If confirming completion, mention only actions actually completed by tool results.",
+            "Do not mention schemas, parameter names, evaluator behavior, or hidden implementation details.",
             "Keep user-facing responses short and TTS-friendly.",
             "Respect all policies in the system/wiki message inside the transcript.",
         ],
@@ -541,9 +695,115 @@ def build_next_action_prompt(
     return json.dumps(prompt, ensure_ascii=False, indent=2)
 
 
+def prompt_component_char_counts(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Return safe prompt-size telemetry without retaining user content."""
+
+    transcript = _messages_for_prompt(messages)
+    return {
+        "system_prompt_chars": sum(
+            len(item.get("content") or "")
+            for item in transcript
+            if item.get("role") == "system"
+        ),
+        "tool_schema_prompt_chars": len(
+            json.dumps(compact_tools_for_prompt(tools), ensure_ascii=False)
+        ),
+        "transcript_prompt_chars": len(json.dumps(transcript, ensure_ascii=False)),
+    }
+
+
+def compact_tools_for_prompt(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the tool-call contract while removing verbose schema-only metadata.
+
+    The evaluator provides rich tool schemas, including examples and long output
+    descriptions. The agent validates model output against the original schema,
+    so the prompt needs only the callable function names and input constraints.
+    """
+
+    compacted: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        compact_function: dict[str, Any] = {"name": name}
+        if description := _compact_description(function.get("description"), 120):
+            compact_function["description"] = description
+        parameters = function.get("parameters")
+        if isinstance(parameters, dict):
+            compact_function["parameters"] = _compact_json_schema(parameters)
+        compacted.append({"type": "function", "function": compact_function})
+    return compacted
+
+
+def _compact_json_schema(schema: dict[str, Any], *, depth: int = 0) -> dict[str, Any]:
+    """Retain the input constraints required to form a valid tool call."""
+
+    if depth >= 4:
+        schema_type = schema.get("type")
+        return {"type": schema_type} if isinstance(schema_type, str) else {}
+
+    compact: dict[str, Any] = {}
+    for key in ("type", "enum", "minimum", "maximum", "multipleOf", "format"):
+        value = schema.get(key)
+        if value is not None:
+            compact[key] = value
+    required = schema.get("required")
+    if isinstance(required, list):
+        compact["required"] = [item for item in required if isinstance(item, str)]
+    if isinstance(schema.get("additionalProperties"), bool):
+        compact["additionalProperties"] = schema["additionalProperties"]
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        compact["properties"] = {
+            str(name): _compact_json_schema(value, depth=depth + 1)
+            for name, value in properties.items()
+            if isinstance(value, dict)
+        }
+    items = schema.get("items")
+    if isinstance(items, dict):
+        compact["items"] = _compact_json_schema(items, depth=depth + 1)
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            compact[key] = [
+                _compact_json_schema(value, depth=depth + 1)
+                for value in variants
+                if isinstance(value, dict)
+            ]
+    return compact
+
+
+def _compact_description(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    return normalized[:limit]
+
+
 def _messages_for_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Preserve policy and task origin while bounding growing tool transcripts."""
+
+    max_messages = _prompt_history_max_messages()
+    selected_messages = messages
+    if len(messages) > max_messages:
+        selected_indices = {0}
+        if len(messages) > 1 and messages[1].get("role") == "user":
+            selected_indices.add(1)
+        tail_count = max(max_messages - len(selected_indices), 0)
+        selected_indices.update(range(max(len(messages) - tail_count, 0), len(messages)))
+        selected_messages = [messages[index] for index in sorted(selected_indices)]
+
     rendered = []
-    for message in messages:
+    for message in selected_messages:
         item: dict[str, Any] = {
             "role": message.get("role"),
             "content": message.get("content"),
@@ -565,6 +825,14 @@ def _messages_for_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return rendered
 
 
+def _prompt_history_max_messages() -> int:
+    value = os.getenv("TRACK2_PROMPT_HISTORY_MAX_MESSAGES", "24")
+    try:
+        return max(4, int(value))
+    except ValueError:
+        return 24
+
+
 def _parse_arguments(arguments: Any) -> Any:
     if isinstance(arguments, str):
         try:
@@ -581,17 +849,13 @@ def parse_next_action(text: str) -> dict[str, Any]:
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise MalformedModelResponseError(
-                f"No JSON object found in: {text[:200]}"
-            )
+            raise MalformedModelResponseError(f"No JSON object found in: {text[:200]}")
         payload = json.loads(text[start : end + 1])
 
     if payload.get("action") == "respond":
         content = payload.get("content")
         if not isinstance(content, str):
-            raise MalformedModelResponseError(
-                "respond action requires string content"
-            )
+            raise MalformedModelResponseError("respond action requires string content")
         return {"action": "respond", "content": content}
 
     if payload.get("action") == "tool_calls":
@@ -603,9 +867,7 @@ def parse_next_action(text: str) -> dict[str, Any]:
         normalized = []
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
-                raise MalformedModelResponseError(
-                    "each tool call must be an object"
-                )
+                raise MalformedModelResponseError("each tool call must be an object")
             tool_name = tool_call.get("tool_name")
             arguments = tool_call.get("arguments")
             if arguments is None and "arguments_json" in tool_call:
@@ -613,9 +875,7 @@ def parse_next_action(text: str) -> dict[str, Any]:
             if arguments is None:
                 arguments = {}
             if not isinstance(tool_name, str) or not tool_name:
-                raise MalformedModelResponseError(
-                    "each tool call requires tool_name"
-                )
+                raise MalformedModelResponseError("each tool call requires tool_name")
             if not isinstance(arguments, dict):
                 raise MalformedModelResponseError(
                     "tool call arguments must be an object"
@@ -628,9 +888,7 @@ def parse_next_action(text: str) -> dict[str, Any]:
 
 def _parse_tool_arguments_json(arguments_json: Any) -> dict[str, Any]:
     if not isinstance(arguments_json, str):
-        raise MalformedModelResponseError(
-            "tool call arguments_json must be a string"
-        )
+        raise MalformedModelResponseError("tool call arguments_json must be a string")
     if not arguments_json.strip():
         return {}
     try:
@@ -672,7 +930,7 @@ NEXT_ACTION_OUTPUT_SCHEMA = {
                         "type": "string",
                         "description": (
                             "JSON object string containing the tool arguments, "
-                            "for example \"{}\" or \"{\\\"position\\\":50}\"."
+                            'for example "{}" or "{\\"position\\":50}".'
                         ),
                     },
                 },
@@ -689,6 +947,10 @@ Use only the supplied CAR-bench tool definitions.
 Return only JSON matching the requested schema.
 Never invent unavailable tools, parameters, or tool results.
 For tool calls, put arguments in arguments_json as a JSON object string.
+For tool-call actions, keep content empty and do not explain the tool call.
 For missing capability or missing information, tell the user transparently.
+When asking the user, ask exactly one concrete question.
+When confirming completion, mention only actions actually completed by tool results.
+Do not mention schemas, parameter names, evaluator behavior, or hidden implementation details.
 Keep spoken responses short, natural, and TTS-friendly.
 Respect confirmation and disambiguation policy from the wiki/system prompt."""

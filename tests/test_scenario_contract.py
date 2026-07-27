@@ -3,6 +3,7 @@ import tomllib
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime
+from importlib.util import module_from_spec, spec_from_file_location
 from io import StringIO
 from pathlib import Path
 
@@ -101,6 +102,199 @@ class ScenarioContractTest(unittest.TestCase):
                     self.assertEqual(config["tasks_base_num_tasks"], -1)
                     self.assertEqual(config["tasks_hallucination_num_tasks"], -1)
                     self.assertEqual(config["tasks_disambiguation_num_tasks"], -1)
+
+    def test_local_docker_baselines_use_fixed_models_and_provider_defaults(self) -> None:
+        track_1 = tomllib.loads(
+            Path(
+                "scenarios/track_1_agent_under_test/local_docker_smoke.toml"
+            ).read_text()
+        )["agent_under_test"]
+        self.assertEqual(track_1["result_model"], "gpt-5.6-sol")
+        self.assertNotIn("AGENT_LLM", track_1["env"])
+        self.assertNotIn("AGENT_TEMPERATURE", track_1["env"])
+        self.assertNotIn("AGENT_REASONING_EFFORT", track_1["env"])
+        track_1_dockerfile = Path(
+            "src/track_1_agent_under_test/Dockerfile.track-1-agent-under-test"
+        ).read_text()
+        self.assertIn("ENV AGENT_LLM=gpt-5.6-sol", track_1_dockerfile)
+
+        track_2 = tomllib.loads(
+            Path(
+                "scenarios/track_2_agent_under_test_cerebras/local_docker_smoke.toml"
+            ).read_text()
+        )["agent_under_test"]
+        self.assertEqual(track_2["result_model"], "gpt-oss-120b")
+        for name in (
+            "TRACK2_EXECUTOR_MODEL",
+            "TRACK2_EXECUTOR_REASONING_EFFORT",
+            "TRACK2_CEREBRAS_SERVICE_TIER",
+            "TRACK2_MAX_COMPLETION_TOKENS",
+            "TRACK2_TEMPERATURE",
+        ):
+            self.assertNotIn(name, track_2["env"])
+        track_2_dockerfile = Path(
+            "src/track_2_agent_under_test_cerebras/"
+            "Dockerfile.track-2-agent-under-test-cerebras"
+        ).read_text()
+        self.assertIn("ENV TRACK2_EXECUTOR_MODEL=gpt-oss-120b", track_2_dockerfile)
+        self.assertIn("ENV TRACK2_MAX_COMPLETION_TOKENS=2048", track_2_dockerfile)
+        self.assertNotIn("TRACK2_EXECUTOR_REASONING_EFFORT=", track_2_dockerfile)
+
+    def test_baseline_images_exclude_organizer_and_hidden_data(self) -> None:
+        dockerignore = Path(".dockerignore").read_text()
+        self.assertIn("hidden_dataset", dockerignore.splitlines())
+        self.assertIn("competition_results", dockerignore.splitlines())
+        self.assertIn(".env", dockerignore.splitlines())
+
+        for dockerfile_path, agent_dir in (
+            (
+                Path(
+                    "src/track_1_agent_under_test/"
+                    "Dockerfile.track-1-agent-under-test"
+                ),
+                "src/track_1_agent_under_test",
+            ),
+            (
+                Path(
+                    "src/track_2_agent_under_test_cerebras/"
+                    "Dockerfile.track-2-agent-under-test-cerebras"
+                ),
+                "src/track_2_agent_under_test_cerebras",
+            ),
+        ):
+            with self.subTest(dockerfile=str(dockerfile_path)):
+                dockerfile = dockerfile_path.read_text()
+                self.assertNotIn("COPY --chown=carbench:carbench src src", dockerfile)
+                self.assertIn(agent_dir, dockerfile)
+                self.assertNotIn("hidden_dataset", dockerfile)
+                self.assertNotIn("src/competition", dockerfile)
+                self.assertNotIn("src/evaluator", dockerfile)
+                self.assertNotIn("--extra car-bench-evaluator", dockerfile)
+
+    def test_evaluator_image_supports_host_uid_execution(self) -> None:
+        dockerfile = Path("src/evaluator/Dockerfile.evaluator").read_text()
+        self.assertIn("chmod 0755 /home/carbench", dockerfile)
+        self.assertIn(
+            'ENTRYPOINT [".venv/bin/python", "src/evaluator/server.py"]',
+            dockerfile,
+        )
+        self.assertNotIn('ENTRYPOINT ["uv", "run"', dockerfile)
+
+    def test_hidden_baseline_scenarios_are_publication_templates(self) -> None:
+        for track, repository, digest in (
+            (
+                "track_1",
+                "car-bench-track1-baseline",
+                "1b75e5e21694f1e734d531329ecd8a1e3285b55ea02278310518cd74117d56e3",
+            ),
+            (
+                "track_2",
+                "car-bench-track2-baseline",
+                "3317677db28cfa02cbcc8d040aac079617a79bc2a5cd2b57858cf406685ba30e",
+            ),
+        ):
+            with self.subTest(track=track):
+                scenario = tomllib.loads(
+                    Path(f"submissions/{track}/team-0/scenario.toml").read_text()
+                )
+                self.assertEqual(
+                    scenario["agent_under_test"]["image"],
+                    f"ghcr.io/car-bench/{repository}@sha256:{digest}",
+                )
+                self.assertEqual(scenario["config"]["num_trials"], 3)
+                self.assertEqual(scenario["config"]["task_split"], "hidden")
+                self.assertEqual(scenario["config"]["max_steps"], 50)
+                self.assertEqual(
+                    scenario["config"]["user_model"],
+                    "gemini-3.5-flash",
+                )
+                self.assertEqual(scenario["config"]["user_provider"], "gemini")
+                self.assertEqual(
+                    scenario["config"]["policy_evaluator_model"],
+                    "gemini-3.5-flash",
+                )
+                self.assertEqual(
+                    scenario["config"]["policy_evaluator_provider"],
+                    "gemini",
+                )
+                self.assertEqual(
+                    scenario["config"]["tasks_base_num_tasks"],
+                    -1,
+                )
+                self.assertEqual(
+                    scenario["config"]["tasks_hallucination_num_tasks"],
+                    -1,
+                )
+                self.assertEqual(
+                    scenario["config"]["tasks_disambiguation_num_tasks"],
+                    -1,
+                )
+
+    def test_track_1_hidden_baseline_uses_reusable_azure_profiles(self) -> None:
+        profile_dir = Path("submissions/track_1/team-0")
+        active = tomllib.loads((profile_dir / "scenario.toml").read_text())
+        gpt_5_5 = tomllib.loads(
+            (profile_dir / "scenario-gpt-5.5-azure.toml").read_text()
+        )
+        gpt_5_6 = tomllib.loads(
+            (profile_dir / "scenario-gpt-5.6-azure.toml").read_text()
+        )
+
+        self.assertEqual(
+            gpt_5_5["agent_under_test"]["image"],
+            gpt_5_6["agent_under_test"]["image"],
+        )
+        self.assertEqual(active, gpt_5_6)
+
+        gpt_5_5_agent = gpt_5_5["agent_under_test"]
+        self.assertEqual(gpt_5_5_agent["env"]["AGENT_LLM"], "azure/gpt-5.5")
+        self.assertEqual(gpt_5_5_agent["env"]["AGENT_REASONING_EFFORT"], "medium")
+        self.assertEqual(gpt_5_5_agent["env"]["AGENT_THINKING"], "true")
+
+        gpt_5_6_agent = gpt_5_6["agent_under_test"]
+        self.assertEqual(
+            gpt_5_6_agent["result_reasoning_effort"],
+            "provider-default-medium",
+        )
+        self.assertEqual(gpt_5_6_agent["env"]["AGENT_API_MODE"], "responses")
+        self.assertEqual(
+            gpt_5_6_agent["env"]["AGENT_RESPONSES_STATE_MODE"],
+            "stateless",
+        )
+        for key in (
+            "AGENT_TEMPERATURE",
+            "AGENT_REASONING_EFFORT",
+            "AGENT_THINKING",
+        ):
+            self.assertNotIn(key, gpt_5_6_agent["env"])
+
+        for scenario in (gpt_5_5, gpt_5_6):
+            agent = scenario["agent_under_test"]
+            for key in (
+                "AZURE_API_KEY",
+                "AZURE_API_BASE",
+                "AZURE_API_VERSION",
+            ):
+                self.assertIn(key, agent["env"])
+            self.assertNotIn("OPENAI_API_KEY", agent["env"])
+
+    def test_gemini_3_evaluator_roles_use_provider_sampling_defaults(self) -> None:
+        module_path = Path(
+            "third_party/car-bench/car_bench/model_utils/sampling.py"
+        )
+        spec = spec_from_file_location("car_bench_sampling_test", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        sampling = module.evaluation_sampling_parameters
+        self.assertEqual(sampling("gemini-3.5-flash", "gemini"), {})
+        self.assertEqual(sampling("gemini/gemini-3.5-flash", "gemini"), {})
+        self.assertEqual(
+            sampling("gemini-2.5-flash", "gemini"),
+            {"temperature": 0.0},
+        )
 
     def test_compose_up_command_uses_root_env_file(self) -> None:
         command = compose_up_command(Path("scenarios/track_1_agent_under_test/docker-compose.yml"))

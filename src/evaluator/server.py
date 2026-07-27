@@ -24,6 +24,7 @@ from a2a.server.routes import create_jsonrpc_routes, create_agent_card_routes
 from a2a.types import AgentCard
 
 from agentbeats.evaluator_executor import EvaluatorExecutor
+from competition.auth import OrganizerTokenMiddleware
 from car_bench_paths import CAR_BENCH_DATA_DIR, SETUP_SCRIPT
 from car_bench_evaluator import CARBenchEvaluator
 
@@ -109,6 +110,7 @@ async def main():
     card_routes = create_agent_card_routes(agent_card)
 
     app = Starlette(routes=routes + card_routes)
+    app.add_middleware(OrganizerTokenMiddleware)
 
     uvicorn_config = uvicorn.Config(app, host=args.host, port=args.port)
     uvicorn_server = uvicorn.Server(uvicorn_config)

@@ -22,3 +22,6 @@ docker-compose.yml
 a2a-scenario.toml
 scenarios/**/docker-compose.yml
 scenarios/**/a2a-scenario.toml
+hidden_dataset/
+competition_results/
+submissions/*

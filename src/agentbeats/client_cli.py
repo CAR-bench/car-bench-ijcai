@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import json
 import asyncio
@@ -47,7 +48,8 @@ def parse_toml(d: dict[str, object]) -> tuple[EvalRequest, str]:
 
     eval_req = EvalRequest(
         agent_under_test=agent_under_test["endpoint"],
-        config=d.get("config", {}) or {}
+        config=d.get("config", {}) or {},
+        run_context=d.get("competition_run"),
     )
     return eval_req, evaluator_endpoint
 
@@ -537,7 +539,16 @@ async def main():
     artifact_records = []
 
     # Send message via streaming
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as httpx_client:
+    organizer_token = os.environ.get("CAR_BENCH_ORGANIZER_TOKEN")
+    client_headers = (
+        {"X-CAR-BENCH-ORGANIZER-TOKEN": organizer_token}
+        if organizer_token
+        else None
+    )
+    async with httpx.AsyncClient(
+        timeout=DEFAULT_TIMEOUT,
+        headers=client_headers,
+    ) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=evaluator_url)
         agent_card = await resolver.get_agent_card()
         config = ClientConfig(

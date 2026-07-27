@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:python3.12-trixie
 
-RUN adduser carbench
+RUN adduser carbench && chmod 0755 /home/carbench
 USER carbench
 RUN mkdir -p /home/carbench/.cache/uv
 WORKDIR /home/carbench/app
@@ -20,6 +20,6 @@ RUN \
     --mount=type=cache,target=/home/carbench/.cache/uv,uid=1000 \
     uv sync --no-editable --no-dev --extra car-bench-evaluator
 
-ENTRYPOINT ["uv", "run", "src/evaluator/server.py"]
+ENTRYPOINT [".venv/bin/python", "src/evaluator/server.py"]
 CMD ["--host", "0.0.0.0"]
 EXPOSE 8081

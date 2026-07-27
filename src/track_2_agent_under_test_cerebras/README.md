@@ -5,11 +5,12 @@ CAR-bench A2A evaluation. It calls Cerebras-hosted `gpt-oss` models directly
 through the Cerebras Python SDK and returns the same benchmark-visible A2A text
 responses or tool calls as the Track 1 template.
 
-The default executor model is `gpt-oss-120b` with
-`TRACK2_EXECUTOR_REASONING_EFFORT=medium`. Participants should use a
-Cerebras-hosted `gpt-oss` executor model, while replacing prompting,
-validation, or harnessing strategy as long as the external A2A contract stays
-unchanged.
+The baseline image uses `gpt-oss-120b`. It omits temperature, reasoning effort,
+and service tier so Cerebras applies its provider defaults (currently `medium`
+reasoning for `gpt-oss-120b`). It intentionally sets a 2,048-token completion
+ceiling as a rate-limit guardrail; that ceiling is an organizer choice, not a
+Cerebras provider default. Participants may replace prompting, validation, or
+harnessing strategy as long as the external A2A contract stays unchanged.
 
 ## What This Agent Demonstrates
 
@@ -29,8 +30,6 @@ Set the evaluator key and Cerebras key in `.env`:
 ```bash
 GEMINI_API_KEY=...
 CEREBRAS_API_KEY=...
-TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-TRACK2_EXECUTOR_REASONING_EFFORT=medium
 ```
 
 Important environment variables:
@@ -39,9 +38,9 @@ Important environment variables:
 | --- | --- | --- |
 | `CEREBRAS_API_KEY` | required | Cerebras API key used by the SDK. |
 | `TRACK2_EXECUTOR_MODEL` | `gpt-oss-120b` | Cerebras-hosted `gpt-oss` executor model. Old `cerebras/...` prefixes are accepted and stripped for compatibility. |
-| `TRACK2_EXECUTOR_REASONING_EFFORT` | `medium` | Cerebras `gpt-oss` reasoning effort for executor calls. Supported values are `low`, `medium`, and `high`. |
+| `TRACK2_EXECUTOR_REASONING_EFFORT` | unset | Optional Cerebras `gpt-oss` reasoning effort override. When unset, Cerebras currently defaults to `medium`. |
 | `TRACK2_CEREBRAS_SERVICE_TIER` | unset | Optional Cerebras service tier, for example `default`, `priority`, `auto`, or `flex`. |
-| `TRACK2_MAX_COMPLETION_TOKENS` | `1024` | Completion-token cap for executor calls. |
+| `TRACK2_MAX_COMPLETION_TOKENS` | `2048` in the baseline image; `1024` in the bare server | Completion-token cap for executor calls. Keep the image default for comparable baseline runs. |
 | `TRACK2_TEMPERATURE` | unset | Optional executor temperature. Leave unset to use the provider default. |
 | `TRACK2_CEREBRAS_QUEUE_BACKOFF_SECONDS` | `60` | Nominal first local pause after a provider `queue_exceeded` 429. |
 | `TRACK2_CEREBRAS_QUEUE_BACKOFF_INITIAL_JITTER_RATIO` | `0.1` | First queue retry jitter ratio; default gives roughly 54-66 seconds. |
@@ -56,9 +55,11 @@ Important environment variables:
 ## Rate Limits And Development Windows
 
 During normal development, participants are expected to use the Cerebras public
-tier, where rate limits can be strict. Use smaller smoke scenarios first, keep
-`TRACK2_MAX_COMPLETION_TOKENS` as low as the task allows, and schedule larger
-public-tier runs externally instead of launching many jobs at once.
+tier, where rate limits can be strict. Cerebras includes the requested maximum
+completion length in its preflight token estimate, so use smaller smoke
+scenarios first, keep `TRACK2_MAX_COMPLETION_TOKENS` as low as the task allows,
+and schedule larger public-tier runs externally instead of launching many jobs
+at once.
 
 The reference client does not proactively throttle based on local request/token
 limits or previous successful responses. It sends the request and only waits

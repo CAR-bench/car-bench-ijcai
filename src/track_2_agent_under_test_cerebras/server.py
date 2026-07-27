@@ -18,14 +18,12 @@ if __package__:
     from .cerebras_client import (
         DEFAULT_CEREBRAS_API_BASE,
         DEFAULT_EXECUTOR_MODEL,
-        DEFAULT_EXECUTOR_REASONING_EFFORT,
     )
 else:
     from car_bench_agent import CARBenchAgentExecutor
     from cerebras_client import (
         DEFAULT_CEREBRAS_API_BASE,
         DEFAULT_EXECUTOR_MODEL,
-        DEFAULT_EXECUTOR_REASONING_EFFORT,
     )
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -128,10 +126,7 @@ def main() -> None:
         else (
             args.reasoning_effort
             if args.reasoning_effort is not None
-            else _env_or_default(
-                "TRACK2_EXECUTOR_REASONING_EFFORT",
-                DEFAULT_EXECUTOR_REASONING_EFFORT,
-            )
+            else _env_or_default("TRACK2_EXECUTOR_REASONING_EFFORT")
         )
     )
     max_completion_tokens = (

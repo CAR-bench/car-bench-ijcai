@@ -6,6 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from google.protobuf.json_format import MessageToDict
+from litellm.completion_extras.litellm_responses_transformation.transformation import (
+    LiteLLMResponsesTransformationHandler,
+)
+from litellm.main import responses_api_bridge_check
 
 from a2a.helpers.proto_helpers import new_data_part, new_text_part
 from agentbeats.sync_client import (
@@ -23,6 +27,12 @@ from car_bench.envs.tool_execution_error_evaluator import (
     tool_execution_errors_during_runtime,
 )
 from car_bench.types import Task, TaskType
+from track_1_agent_under_test.car_bench_agent import (
+    _assistant_content as track_1_assistant_content,
+    _completion_kwargs as track_1_completion_kwargs,
+    _is_missing_response_item_error,
+    _remove_unencrypted_reasoning_items,
+)
 from track_2_agent_under_test_cerebras.car_bench_agent import (
     CARBenchAgentExecutor as CerebrasCARBenchAgentExecutor,
 )
@@ -166,6 +176,264 @@ def fake_task() -> Task:
 
 
 class A2AResponseContractTest(unittest.TestCase):
+    def test_track_1_gpt_5_6_sol_chat_tools_disable_reasoning(self) -> None:
+        kwargs = track_1_completion_kwargs(
+            model="gpt-5.6-sol",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "demo",
+                        "description": "demo",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            temperature=None,
+            thinking=False,
+            reasoning_effort=None,
+            interleaved_thinking=False,
+        )
+
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertNotIn("temperature", kwargs)
+
+    def test_track_1_other_requests_keep_reasoning_unspecified(self) -> None:
+        for model, tools in (
+            ("gpt-5.6-sol", []),
+            (
+                "another-provider/model",
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "demo",
+                            "description": "demo",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            ),
+        ):
+            with self.subTest(model=model, has_tools=bool(tools)):
+                kwargs = track_1_completion_kwargs(
+                    model=model,
+                    tools=tools,
+                    temperature=None,
+                    thinking=False,
+                    reasoning_effort=None,
+                    interleaved_thinking=False,
+                )
+                self.assertNotIn("reasoning_effort", kwargs)
+
+    def test_track_1_azure_responses_uses_stateless_encrypted_reasoning(self) -> None:
+        kwargs = track_1_completion_kwargs(
+            model="azure/gpt-5.6-sol",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "demo",
+                        "description": "demo",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            temperature=None,
+            thinking=False,
+            reasoning_effort=None,
+            interleaved_thinking=False,
+            api_mode="responses",
+        )
+
+        self.assertEqual(kwargs["model"], "azure/responses/gpt-5.6-sol")
+        self.assertIs(kwargs["store"], False)
+        self.assertEqual(kwargs["include"], ["reasoning.encrypted_content"])
+        self.assertNotIn("temperature", kwargs)
+        self.assertNotIn("reasoning_effort", kwargs)
+        bridge, routed_model = responses_api_bridge_check(
+            model="responses/gpt-5.6-sol",
+            custom_llm_provider="azure",
+        )
+        self.assertEqual(bridge["mode"], "responses")
+        self.assertEqual(routed_model, "gpt-5.6-sol")
+
+    def test_track_1_merges_responses_bridge_output_items(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        model_dump=lambda **_: {
+                            "content": "Working.",
+                            "reasoning_items": [
+                                {
+                                    "id": "rs_1",
+                                    "type": "reasoning",
+                                    "encrypted_content": "encrypted-trace",
+                                }
+                            ],
+                        }
+                    )
+                ),
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        model_dump=lambda **_: {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "demo",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                ),
+            ]
+        )
+
+        content = track_1_assistant_content(response)
+
+        self.assertEqual(content["content"], "Working.")
+        self.assertEqual(content["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(content["reasoning_items"][0]["id"], "rs_1")
+        self.assertEqual(
+            content["reasoning_items"][0]["encrypted_content"],
+            "encrypted-trace",
+        )
+
+    def test_track_1_provider_default_responses_state_is_runtime_selectable(
+        self,
+    ) -> None:
+        kwargs = track_1_completion_kwargs(
+            model="azure/gpt-5.6-sol",
+            tools=[],
+            temperature=None,
+            thinking=False,
+            reasoning_effort=None,
+            interleaved_thinking=False,
+            api_mode="responses",
+            responses_state_mode="provider-default",
+        )
+
+        self.assertNotIn("store", kwargs)
+        self.assertNotIn("include", kwargs)
+
+    def test_track_1_litellm_bridge_replays_encrypted_reasoning(self) -> None:
+        request = LiteLLMResponsesTransformationHandler().transform_request(
+            model="gpt-5.6-sol",
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "user"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_items": [
+                        {
+                            "id": "rs_portable",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": "encrypted-trace",
+                        }
+                    ],
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "demo",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "ok",
+                },
+            ],
+            optional_params={
+                "store": False,
+                "include": ["reasoning.encrypted_content"],
+            },
+            litellm_params={},
+            headers={},
+            litellm_logging_obj=SimpleNamespace(),
+        )
+
+        self.assertIs(request["store"], False)
+        self.assertEqual(
+            request["include"],
+            ["reasoning.encrypted_content"],
+        )
+        reasoning_item = next(
+            item for item in request["input"] if item["type"] == "reasoning"
+        )
+        self.assertEqual(
+            reasoning_item["encrypted_content"],
+            "encrypted-trace",
+        )
+
+    def test_track_1_removes_only_unencrypted_reasoning_items(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_items": [
+                    {"id": "rs_stale", "type": "reasoning"},
+                    {
+                        "id": "rs_portable",
+                        "type": "reasoning",
+                        "encrypted_content": "encrypted-trace",
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_items": [
+                    {
+                        "id": "rs_none",
+                        "type": "reasoning",
+                        "encrypted_content": None,
+                    }
+                ],
+            },
+        ]
+
+        removed = _remove_unencrypted_reasoning_items(messages)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(
+            messages[0]["reasoning_items"],
+            [
+                {
+                    "id": "rs_portable",
+                    "type": "reasoning",
+                    "encrypted_content": "encrypted-trace",
+                }
+            ],
+        )
+        self.assertNotIn("reasoning_items", messages[1])
+
+    def test_track_1_recognizes_missing_responses_item_error(self) -> None:
+        self.assertTrue(
+            _is_missing_response_item_error(
+                RuntimeError(
+                    "invalid_request_error: Item with id 'rs_stale' not found"
+                )
+            )
+        )
+        self.assertFalse(
+            _is_missing_response_item_error(
+                RuntimeError("invalid_request_error: malformed tool arguments")
+            )
+        )
+
     def test_sync_client_serializes_a2a_1_json_field_names(self) -> None:
         message = create_message_with_parts(
             parts=[new_text_part("hello")],

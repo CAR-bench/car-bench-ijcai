@@ -1,5 +1,6 @@
 """Server entry point for CAR-bench agent under test."""
 import argparse
+import os
 import sys
 from pathlib import Path
 import warnings
@@ -28,6 +29,13 @@ from logging_utils import configure_logger
 sys.path.pop(0)
 
 logger = configure_logger(role="agent_under_test", context="server")
+
+
+def _env_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
 
 
 def prepare_agent_card(url: str) -> AgentCard:
@@ -74,24 +82,60 @@ def main():
     )
     parser.add_argument("--temperature", type=float, default=None, help="Temperature for the LLM")
     parser.add_argument("--thinking", action="store_true", help="Enable thinking mode for the LLM")
-    parser.add_argument("--reasoning-effort", type=str, default="medium", help="Reasoning effort level for the LLM")
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        help="Optional reasoning effort level for the LLM",
+    )
+    parser.add_argument(
+        "--api-mode",
+        choices=("chat", "responses"),
+        default=None,
+        help="OpenAI-compatible API mode (can also be set via AGENT_API_MODE)",
+    )
+    parser.add_argument(
+        "--responses-state-mode",
+        choices=("stateless", "provider-default"),
+        default=None,
+        help=(
+            "Responses conversation state mode "
+            "(can also be set via AGENT_RESPONSES_STATE_MODE)"
+        ),
+    )
     parser.add_argument("--interleaved-thinking", action="store_true", help="Enable interleaved thinking for the LLM")
     args = parser.parse_args()
 
     # Support both command-line args and environment variables
     # Priority: CLI args > env vars > default
-    import os
     agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "gemini/gemini-2.5-flash")
+    api_mode = args.api_mode or os.getenv("AGENT_API_MODE", "chat").strip().lower()
+    if api_mode not in {"chat", "responses"}:
+        parser.error("AGENT_API_MODE must be 'chat' or 'responses'")
+    responses_state_mode = (
+        args.responses_state_mode
+        or os.getenv("AGENT_RESPONSES_STATE_MODE", "stateless").strip().lower()
+    )
+    if responses_state_mode not in {"stateless", "provider-default"}:
+        parser.error(
+            "AGENT_RESPONSES_STATE_MODE must be 'stateless' or 'provider-default'"
+        )
     completion_kwargs = {
-        "temperature": args.temperature or os.getenv("AGENT_TEMPERATURE", None),
+        "temperature": (
+            args.temperature
+            if args.temperature is not None
+            else _env_float("AGENT_TEMPERATURE")
+        ),
         "thinking": args.thinking or (os.getenv("AGENT_THINKING", "false").lower() == "true"),
-        "reasoning_effort": args.reasoning_effort or os.getenv("AGENT_REASONING_EFFORT", "medium"),
+        "reasoning_effort": args.reasoning_effort or os.getenv("AGENT_REASONING_EFFORT"),
         "interleaved_thinking": args.interleaved_thinking or (os.getenv("AGENT_INTERLEAVED_THINKING", "false").lower() == "true"),
     }
 
     logger.info(
         "Starting CAR-bench agent",
         model=agent_llm,
+        api_mode=api_mode,
+        responses_state_mode=responses_state_mode,
         temperature=completion_kwargs["temperature"],
         thinking=completion_kwargs["thinking"],
         reasoning_effort=completion_kwargs["reasoning_effort"],
@@ -108,8 +152,10 @@ def main():
             temperature=completion_kwargs["temperature"],
             thinking=completion_kwargs["thinking"],
             reasoning_effort=completion_kwargs["reasoning_effort"],
-            interleaved_thinking=completion_kwargs["interleaved_thinking"]
-            ),
+            interleaved_thinking=completion_kwargs["interleaved_thinking"],
+            api_mode=api_mode,
+            responses_state_mode=responses_state_mode,
+        ),
         task_store=InMemoryTaskStore(),
         agent_card=card,
     )

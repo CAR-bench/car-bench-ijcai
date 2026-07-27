@@ -34,7 +34,23 @@ For exact schemas and helper functions, read the
 
 ## Configuration
 
-Set the evaluator key and your model/provider keys in `.env`:
+The Docker baseline supports both Chat Completions (`AGENT_API_MODE=chat`, the
+default) and Responses (`AGENT_API_MODE=responses`) through LiteLLM. Chat mode
+sends `reasoning_effort="none"` for GPT-5.6 Sol function-tool requests.
+Responses mode preserves reasoning items across tool turns and can leave
+reasoning effort unset so GPT-5.6 Sol applies its provider default. By default,
+Responses requests use portable stateless replay (`store=false` with encrypted
+reasoning content) instead of relying on provider-side response-item storage.
+
+Set the evaluator and OpenAI keys in `.env`:
+
+```bash
+GEMINI_API_KEY=...
+OPENAI_API_KEY=...
+```
+
+The non-Docker starter remains provider-neutral. To use another model locally,
+set its LiteLLM model string and provider key, for example:
 
 ```bash
 GEMINI_API_KEY=...
@@ -45,6 +61,23 @@ ANTHROPIC_API_KEY=...
 `AGENT_LLM` can be any LiteLLM-compatible model string if you keep this starter
 implementation. If you replace the model client, keep the A2A input/output
 contract unchanged.
+
+`AGENT_TEMPERATURE` and `AGENT_REASONING_EFFORT` are optional overrides. Leave
+them unset for the baseline. `AGENT_REASONING_EFFORT` is sent only when thinking
+mode is explicitly enabled, except for the GPT-5.6 Sol Chat Completions
+compatibility rule above.
+
+For Azure Responses, use the Azure deployment name and select the API mode:
+
+```bash
+AGENT_LLM=azure/gpt-5.6-sol
+AGENT_API_MODE=responses
+AGENT_RESPONSES_STATE_MODE=stateless
+```
+
+`AGENT_RESPONSES_STATE_MODE=provider-default` restores the provider's default
+storage behavior. Stateless mode is recommended for isolated benchmark trials
+and zero-data-retention-compatible deployments.
 
 ## Run
 

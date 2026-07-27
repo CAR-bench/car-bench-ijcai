@@ -36,16 +36,171 @@ logger = configure_logger(role="agent_under_test", context="-")
 
 SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
 
+RESPONSES_STATE_MODES = {"stateless", "provider-default"}
+
+
+def _completion_kwargs(
+    *,
+    model: str,
+    tools: list[dict],
+    temperature: float | None,
+    thinking: bool,
+    reasoning_effort: str | None,
+    interleaved_thinking: bool,
+    api_mode: str = "chat",
+    responses_state_mode: str = "stateless",
+) -> dict:
+    """Build provider kwargs while keeping baseline settings narrowly scoped."""
+    if responses_state_mode not in RESPONSES_STATE_MODES:
+        raise ValueError(
+            "responses_state_mode must be 'stateless' or 'provider-default'"
+        )
+
+    if api_mode == "responses":
+        if model.startswith(("azure/responses/", "openai/responses/", "responses/")):
+            request_model = model
+        elif model.startswith(("azure/", "openai/")):
+            provider, deployment = model.split("/", 1)
+            request_model = f"{provider}/responses/{deployment}"
+        else:
+            request_model = f"openai/responses/{model}"
+    elif api_mode == "chat":
+        request_model = model
+    else:
+        raise ValueError("api_mode must be 'chat' or 'responses'")
+
+    kwargs = {
+        "model": request_model,
+        "tools": tools if tools else None,
+    }
+
+    if api_mode == "responses" and responses_state_mode == "stateless":
+        # Portable encrypted reasoning avoids relying on Azure's server-side
+        # rs_* item lookup when replaying tool-call history.
+        kwargs["store"] = False
+        kwargs["include"] = ["reasoning.encrypted_content"]
+
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    # GPT-5.6 Sol's default reasoning mode is incompatible with function tools
+    # on Chat Completions. The baseline intentionally retains Chat Completions,
+    # so disable reasoning only for this otherwise-invalid combination.
+    normalized_model = model.removeprefix("openai/").removeprefix("azure/")
+    if api_mode == "chat" and tools and normalized_model == "gpt-5.6-sol":
+        kwargs["reasoning_effort"] = "none"
+
+    if thinking:
+        if model == "claude-opus-4-6":
+            kwargs["thinking"] = {"type": "adaptive"}
+        elif reasoning_effort is not None:
+            if reasoning_effort in [
+                "none",
+                "disable",
+                "low",
+                "medium",
+                "high",
+            ]:
+                kwargs["reasoning_effort"] = reasoning_effort
+            else:
+                try:
+                    thinking_budget = int(reasoning_effort)
+                except ValueError:
+                    raise ValueError(
+                        "reasoning_effort must be 'none', 'disable', 'low', "
+                        "'medium', 'high', or an integer value"
+                    )
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget,
+                }
+
+        if interleaved_thinking:
+            kwargs["extra_headers"] = {
+                "anthropic-beta": "interleaved-thinking-2025-05-14"
+            }
+
+    return kwargs
+
+
+def _assistant_content(response) -> dict:
+    """Merge Responses-bridge output items into one Chat-style assistant message."""
+    messages = [
+        choice.message.model_dump(exclude_unset=True)
+        for choice in response.choices
+    ]
+    if not messages:
+        raise ValueError("LLM response contained no choices")
+
+    merged = dict(messages[0])
+    for key in ("tool_calls", "reasoning_items", "thinking_blocks"):
+        values = [item for message in messages for item in (message.get(key) or [])]
+        if values:
+            merged[key] = values
+    for key in ("content", "reasoning_content"):
+        values = [message.get(key) for message in messages if message.get(key)]
+        if values:
+            merged[key] = "\n".join(values)
+    return merged
+
+
+def _portable_reasoning_items(reasoning_items: list[dict]) -> list[dict]:
+    """Return only reasoning items that can be replayed without provider state."""
+    return [
+        item
+        for item in reasoning_items
+        if isinstance(item, dict) and item.get("encrypted_content")
+    ]
+
+
+def _remove_unencrypted_reasoning_items(messages: list[dict]) -> int:
+    """Remove stale ID-only reasoning items from an existing message history."""
+    removed = 0
+    for message in messages:
+        reasoning_items = message.get("reasoning_items")
+        if not reasoning_items:
+            continue
+
+        portable_items = _portable_reasoning_items(reasoning_items)
+        removed += len(reasoning_items) - len(portable_items)
+        if portable_items:
+            message["reasoning_items"] = portable_items
+        else:
+            message.pop("reasoning_items", None)
+
+    return removed
+
+
+def _is_missing_response_item_error(error: Exception) -> bool:
+    """Identify the transient Azure Responses missing-item failure."""
+    message = str(error)
+    return (
+        "Item with id" in message
+        and "not found" in message
+        and "invalid_request_error" in message
+    )
+
 
 class CARBenchAgentExecutor(AgentExecutor):
     """Executor for the CAR-bench agent under test using native tool calling."""
 
-    def __init__(self, model: str, temperature: float = 0.0, thinking: bool = False, reasoning_effort: str = "medium", interleaved_thinking: bool = False):
+    def __init__(
+        self,
+        model: str,
+        temperature: float | None = None,
+        thinking: bool = False,
+        reasoning_effort: str | None = None,
+        interleaved_thinking: bool = False,
+        api_mode: str = "chat",
+        responses_state_mode: str = "stateless",
+    ):
         self.model = model
         self.temperature = temperature
         self.thinking = thinking
         self.reasoning_effort = reasoning_effort  # Can be 'none', 'disable', 'low', 'medium', 'high', or integer token budget
         self.interleaved_thinking = interleaved_thinking  # Whether to use interleaved thinking
+        self.api_mode = api_mode
+        self.responses_state_mode = responses_state_mode
         self.ctx_id_to_messages: dict[str, list[dict]] = {}
         self.ctx_id_to_tools: dict[str, list[dict]] = {}
         # Per-context turn metrics accumulation (reset when final response is sent)
@@ -186,51 +341,47 @@ class CARBenchAgentExecutor(AgentExecutor):
             if messages:
                 messages[0]["cache_control"] = {"type": "ephemeral"}
 
-            completion_kwargs = {
-                "model": self.model,
-                "tools": tools if tools else None
-            }
-
-            if self.temperature is not None:
-                completion_kwargs["temperature"] = self.temperature
-
-            # Configure reasoning effort / thinking
-            if self.thinking:
-                    if self.model == "claude-opus-4-6":
-                        completion_kwargs["thinking"] = {
-                            "type": "adaptive"
-                        }
-                    else:
-                        if self.reasoning_effort in [
-                            "none",
-                            "disable",
-                            "low",
-                            "medium",
-                            "high",
-                        ]:
-                            completion_kwargs["reasoning_effort"] = self.reasoning_effort
-                        else:
-                            try:
-                                thinking_budget = int(self.reasoning_effort)
-                            except ValueError:
-                                raise ValueError(
-                                    "reasoning_effort must be 'none', 'disable', 'low', 'medium', 'high', or an integer value"
-                                )
-                            completion_kwargs["thinking"] = {
-                                "type": "enabled",
-                                "budget_tokens": thinking_budget,
-                            }
-                    if self.interleaved_thinking:
-                        completion_kwargs["extra_headers"] = {
-                                "anthropic-beta": "interleaved-thinking-2025-05-14"
-                            }
-
+            completion_kwargs = _completion_kwargs(
+                model=self.model,
+                tools=tools,
+                temperature=self.temperature,
+                thinking=self.thinking,
+                reasoning_effort=self.reasoning_effort,
+                interleaved_thinking=self.interleaved_thinking,
+                api_mode=self.api_mode,
+                responses_state_mode=self.responses_state_mode,
+            )
 
             call_start_time = time.perf_counter()
-            response = completion(
-                messages=messages,
-                **completion_kwargs
-            )
+            llm_call_count = 1
+            try:
+                response = completion(
+                    messages=messages,
+                    **completion_kwargs
+                )
+            except Exception as error:
+                should_recover = (
+                    self.api_mode == "responses"
+                    and self.responses_state_mode == "stateless"
+                    and _is_missing_response_item_error(error)
+                )
+                removed_items = (
+                    _remove_unencrypted_reasoning_items(messages)
+                    if should_recover
+                    else 0
+                )
+                if not removed_items:
+                    raise
+
+                ctx_logger.warning(
+                    "Retrying without stale Responses reasoning items",
+                    removed_reasoning_items=removed_items,
+                )
+                llm_call_count += 1
+                response = completion(
+                    messages=messages,
+                    **completion_kwargs
+                )
 
             # Accumulate turn metrics for this LLM call
             call_end_time = time.perf_counter()
@@ -256,12 +407,11 @@ class CARBenchAgentExecutor(AgentExecutor):
                 if details:
                     turn_m[THINKING_TOKENS] += getattr(details, "reasoning_tokens", 0) or 0
             turn_m[COST] += getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
-            turn_m[NUM_LLM_CALLS] += 1
+            turn_m[NUM_LLM_CALLS] += llm_call_count
             turn_m["_total_llm_time_ms"] += call_elapsed_ms
 
             # Get the message from LLM
-            llm_message = response.choices[0].message
-            assistant_content = llm_message.model_dump(exclude_unset=True)
+            assistant_content = _assistant_content(response)
 
             # Extract tool calls from assistant content
             tool_calls = assistant_content.get("tool_calls")
@@ -338,6 +488,22 @@ class CARBenchAgentExecutor(AgentExecutor):
             assistant_message_for_history["thinking_blocks"] = assistant_content["thinking_blocks"]
         if assistant_content.get("reasoning_content"):
             assistant_message_for_history["reasoning_content"] = assistant_content["reasoning_content"]
+        if assistant_content.get("reasoning_items"):
+            reasoning_items = assistant_content["reasoning_items"]
+            if (
+                self.api_mode == "responses"
+                and self.responses_state_mode == "stateless"
+            ):
+                portable_items = _portable_reasoning_items(reasoning_items)
+                dropped_items = len(reasoning_items) - len(portable_items)
+                if dropped_items:
+                    ctx_logger.warning(
+                        "Dropping non-portable Responses reasoning items",
+                        dropped_reasoning_items=dropped_items,
+                    )
+                reasoning_items = portable_items
+            if reasoning_items:
+                assistant_message_for_history["reasoning_items"] = reasoning_items
 
         messages.append(assistant_message_for_history)
 

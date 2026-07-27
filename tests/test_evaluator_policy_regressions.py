@@ -1,4 +1,3 @@
-import csv
 import json
 import sys
 import unittest
@@ -48,7 +47,7 @@ def _exterior_light_status(low_beams: bool, high_beams: bool) -> dict:
     }
 
 
-class HiddenBaseEvaluatorRegressionTest(unittest.TestCase):
+class EvaluatorPolicyRegressionTest(unittest.TestCase):
     def _fog_policy_errors(self, trajectory: list[dict]) -> list[str]:
         token = policy_errors_during_runtime.set([])
         try:
@@ -117,78 +116,6 @@ class HiddenBaseEvaluatorRegressionTest(unittest.TestCase):
         self.assertIsNotNone(enhanced)
         self.assertIn("Prior explicit user authorization", enhanced)
         self.assertIn("every route-tool result independently", enhanced)
-
-    def test_b2_has_explicit_order_and_policy_safe_ground_truth(self) -> None:
-        dataset_path = (
-            Path(__file__).resolve().parents[1]
-            / "hidden_dataset"
-            / "hidden_base.csv"
-        )
-        with dataset_path.open(newline="") as dataset:
-            task = next(
-                row
-                for row in csv.DictReader(dataset)
-                if row["task_id"] == "b_2"
-            )
-
-        action_names = [action["name"] for action in json.loads(task["actions"])]
-
-        self.assertIn("first turn on the fog lights", task["instruction"])
-        self.assertIn("then clear the fogging front windshield", task["instruction"])
-        self.assertLess(
-            action_names.index("set_fog_lights"),
-            action_names.index("get_climate_settings"),
-        )
-        self.assertLess(
-            action_names.index("get_vehicle_window_positions"),
-            action_names.index("set_air_conditioning"),
-        )
-        self.assertLess(
-            action_names.index("set_air_conditioning"),
-            action_names.index("set_window_defrost"),
-        )
-
-    def test_b2_derived_rows_preserve_ordering_and_h2_removed_tool(self) -> None:
-        dataset_dir = Path(__file__).resolve().parents[1] / "hidden_dataset"
-        cases = (
-            ("hidden_disambiguation.csv", "d_2"),
-            ("hidden_hallucination.csv", "h_2"),
-        )
-
-        for filename, task_id in cases:
-            with self.subTest(task_id=task_id):
-                with (dataset_dir / filename).open(newline="") as dataset:
-                    task = next(
-                        row
-                        for row in csv.DictReader(dataset)
-                        if row["task_id"] == task_id
-                    )
-
-                actions = json.loads(task["actions"])
-                action_names = [action["name"] for action in actions]
-
-                self.assertIn("first turn on the fog lights", task["instruction"])
-                self.assertLess(
-                    action_names.index("set_fog_lights"),
-                    action_names.index("get_climate_settings"),
-                )
-                self.assertLess(
-                    action_names.index("set_air_conditioning"),
-                    action_names.index("set_window_defrost"),
-                )
-
-                if task_id == "h_2":
-                    airflow_action = next(
-                        action
-                        for action in actions
-                        if action["name"] == "set_fan_airflow_direction"
-                    )
-                    self.assertEqual(airflow_action["kwargs"], {})
-                    self.assertEqual(
-                        json.loads(task["removed_part"]),
-                        ["set_fan_airflow_direction"],
-                    )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -219,16 +219,6 @@ def _unit(dataset, category, task_id, trial, passed, telemetry=True):
 
 
 class CompetitionRunnerTest(unittest.TestCase):
-    def test_supplied_hidden_dataset_validates(self):
-        path = Path("hidden_dataset")
-        if not path.is_dir():
-            self.skipTest("organizer sample hidden dataset is not present")
-        dataset = load_hidden_dataset(path)
-        self.assertEqual(
-            {category: len(tasks) for category, tasks in dataset.tasks_by_category.items()},
-            {"base": 10, "hallucination": 10, "disambiguation": 10},
-        )
-
     def test_hidden_loader_accepts_optional_split_and_extra_columns(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

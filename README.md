@@ -1,7 +1,7 @@
 # IJCAI-ECAI 2026 Competition
 # CAR-bench: Building Reliable LLM Agents Under Real-World Uncertainty
 
-[![Paper](https://img.shields.io/badge/Paper-2601.22027-b31b1b.svg)](https://arxiv.org/abs/2601.22027)
+[![Paper](https://img.shields.io/badge/ACL%202026-2026.acl--long.1886-b31b1b.svg)](https://aclanthology.org/2026.acl-long.1886/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![A2A](https://img.shields.io/badge/A2A-Protocol-blue.svg)](https://a2a-protocol.org)
 [![Website](https://img.shields.io/badge/Website-CAR--bench-blue)](https://car-bench.github.io/car-bench/)
@@ -136,14 +136,20 @@ ANTHROPIC_API_KEY=...
 
 The Track 1 starter is documented in
 [`src/track_1_agent_under_test/README.md`](src/track_1_agent_under_test/README.md).
+Its Docker baseline supports Chat Completions and Responses through
+`AGENT_API_MODE`. The organizer Azure GPT-5.6 Sol profile uses Responses and
+leaves temperature and reasoning effort unset, applying the provider-default
+reasoning level while retaining function tools.
 
 ### Track 2 Setup
 
 Track 2 uses direct Cerebras `gpt-oss` inference through the Cerebras Python SDK.
 Participants should use Cerebras-hosted `gpt-oss` models. The direct executor
-defaults to `gpt-oss-120b` with `TRACK2_EXECUTOR_REASONING_EFFORT=medium`. The
-planner/executor template also defaults the private planner to `gpt-oss-120b`,
-with `TRACK2_PLANNER_REASONING_EFFORT=high` and executor effort `medium`.
+baseline image uses `gpt-oss-120b`, omits the reasoning and temperature fields
+so Cerebras applies provider defaults, and sets a 2,048-token completion ceiling
+as a rate-limit guardrail. The planner/executor template separately defaults the
+private planner to `gpt-oss-120b`, with `TRACK2_PLANNER_REASONING_EFFORT=high`
+and executor effort `medium`.
 
 ```bash
 uv sync --extra track-2-agent --extra car-bench-evaluator
@@ -154,8 +160,6 @@ Then add the evaluator and Cerebras keys to `.env`:
 ```bash
 GEMINI_API_KEY=...
 CEREBRAS_API_KEY=...
-TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-TRACK2_EXECUTOR_REASONING_EFFORT=medium
 ```
 
 For the planner/executor template, the default planner is also Cerebras
@@ -341,6 +345,35 @@ Results are written under `output/<agent-name>/` with filenames that include
 timestamp, scenario, task selection, trial count, and reliable model/reasoning
 hints when the scenario exposes them.
 
+### Organizer hidden-dataset runner
+
+Organizers run the final hidden evaluation through the separate resumable
+competition command. It validates the submitted Docker scenario, mounts the
+hidden CSVs only into the official evaluator, and persists every task-trial
+before advancing:
+
+```bash
+uv run car-bench-competition start submissions/track_2/team-17/scenario.toml \
+  --track track_2 \
+  --team-id team-17 \
+  --team-name "Team Seventeen" \
+  --dataset-dir hidden_dataset \
+  --results-root competition_results \
+  --env-file .env
+```
+
+Interrupted runs resume by run directory, and completed runs can be aggregated
+into a CSV/JSON leaderboard and standard SVG plots:
+
+```bash
+uv run car-bench-competition resume competition_results/track_2/team-17/<run-id>
+uv run car-bench-competition aggregate --results-root competition_results --track track_2
+```
+
+See [`docs/organizer-hidden-evaluation.md`](docs/organizer-hidden-evaluation.md)
+for folder layout, recovery behavior, privacy boundaries, score accounting, and
+paused-run review.
+
 ---
 
 ## Submission Instructions
@@ -398,8 +431,8 @@ Field notes:
 - `[evaluator]` must use the official organizer-published evaluator image.
   Participants do not submit, modify, or self-host evaluator images for
   official evaluation.
-- `[evaluator.env]` may reference evaluator env var names, but organizers
-  provide evaluator secrets for official runs.
+- `[evaluator.env]` may reference `GEMINI_API_KEY`, `GOOGLE_API_KEY`, and
+  `LOGURU_LEVEL`; organizers provide evaluator secrets for official runs.
 - `[agent_under_test].image` must point to a public digest-pinned GHCR image,
   not a mutable tag.
 - `[agent_under_test.env]` lists the env vars organizers must provide. Use
@@ -502,14 +535,24 @@ Rules of thumb:
 If you use CAR-bench in your research, please cite:
 
 ```bibtex
-@misc{kirmayr2026carbenchevaluatingconsistencylimitawareness,
-      title={CAR-bench: Evaluating the Consistency and Limit-Awareness of LLM Agents under Real-World Uncertainty},
-      author={Johannes Kirmayr and Lukas Stappen and Elisabeth Andre},
-      year={2026},
-      eprint={2601.22027},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2601.22027},
+@inproceedings{kirmayr-etal-2026-car,
+    title = "{CAR}-bench: Evaluating the Consistency and Limit-Awareness of {LLM} Agents under Real-World Uncertainty",
+    author = "Kirmayr, Johannes  and
+      Stappen, Lukas  and
+      Andre, Elisabeth",
+    editor = "Liakata, Maria  and
+      Moreira, Viviane P.  and
+      Zhang, Jiajun  and
+      Jurgens, David",
+    booktitle = "Proceedings of the 64th Annual Meeting of the {A}ssociation for {C}omputational {L}inguistics (Volume 1: Long Papers)",
+    month = jul,
+    year = "2026",
+    address = "San Diego, California, United States",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2026.acl-long.1886/",
+    doi = "10.18653/v1/2026.acl-long.1886",
+    pages = "40599--40618",
+    ISBN = "979-8-89176-390-6"
 }
 ```
 
@@ -519,5 +562,5 @@ If you use CAR-bench in your research, please cite:
 
 - Original CAR-bench: [github.com/CAR-bench/car-bench](https://github.com/CAR-bench/car-bench)
 - Competition website: [car-bench.github.io/car-bench](https://car-bench.github.io/car-bench/)
-- Paper: [arxiv.org/abs/2601.22027](https://arxiv.org/abs/2601.22027)
+- Paper: [aclanthology.org/2026.acl-long.1886](https://aclanthology.org/2026.acl-long.1886/)
 - A2A Protocol: [a2a-protocol.org](https://a2a-protocol.org)

@@ -36,7 +36,6 @@ if __package__:
     from .cerebras_client import (
         DEFAULT_CEREBRAS_API_BASE,
         DEFAULT_EXECUTOR_MODEL,
-        DEFAULT_EXECUTOR_REASONING_EFFORT,
         CerebrasCompletionClient,
         CerebrasTemplateError,
         MalformedModelResponseError,
@@ -47,7 +46,6 @@ else:
     from cerebras_client import (
         DEFAULT_CEREBRAS_API_BASE,
         DEFAULT_EXECUTOR_MODEL,
-        DEFAULT_EXECUTOR_REASONING_EFFORT,
         CerebrasCompletionClient,
         CerebrasTemplateError,
         MalformedModelResponseError,
@@ -81,7 +79,7 @@ class CARBenchAgentExecutor(AgentExecutor):
         api_base: str = DEFAULT_CEREBRAS_API_BASE,
         service_tier: str | None = None,
         temperature: float | None = None,
-        reasoning_effort: str | None = DEFAULT_EXECUTOR_REASONING_EFFORT,
+        reasoning_effort: str | None = None,
         max_completion_tokens: int = 1024,
         malformed_retries: int = 1,
     ) -> None:

@@ -79,3 +79,22 @@ def extract_turn_metrics(metadata) -> dict:
         return {key: metrics.get(key, default) for key, default in defaults.items()}
 
     return defaults
+
+
+def reported_turn_metric_fields(metadata) -> list[str]:
+    """Return fields actually supplied by the participant, without defaults."""
+
+    if metadata is None:
+        return []
+    if hasattr(metadata, "fields"):
+        fields = metadata.fields
+        if TURN_METRICS_KEY not in fields:
+            return []
+        metrics_value = fields[TURN_METRICS_KEY]
+        if hasattr(metrics_value, "struct_value"):
+            return sorted(metrics_value.struct_value.fields)
+    if isinstance(metadata, dict):
+        metrics = metadata.get(TURN_METRICS_KEY)
+        if isinstance(metrics, dict):
+            return sorted(metrics)
+    return []

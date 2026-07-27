@@ -41,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from logging_utils import configure_logger
 from turn_metrics import (
     TURN_METRICS_KEY, SOURCE_KEY, SOURCE_USER, SOURCE_ENVIRONMENT,
-    extract_turn_metrics, AVG_LLM_CALL_TIME_MS, NUM_LLM_CALLS, COST,
+    extract_turn_metrics, reported_turn_metric_fields,
+    AVG_LLM_CALL_TIME_MS, NUM_LLM_CALLS, COST,
     QUOTA_WAIT_TIME_MS, PROMPT_TOKENS, COMPLETION_TOKENS, THINKING_TOKENS,
 )
 try:
@@ -422,6 +423,7 @@ def create_remote_agent_factory(agent_url: str):
 
                 # Extract turn_metrics from response metadata (only on final responses)
                 response_metadata = getattr(response, "metadata", None)
+                reported_metric_fields = reported_turn_metric_fields(response_metadata)
                 turn_metrics = extract_turn_metrics(response_metadata)
 
                 quota_wait_time_ms = _safe_float(
@@ -442,6 +444,8 @@ def create_remote_agent_factory(agent_url: str):
 
                 # Attach metrics to the message if this is a final response (no tool calls)
                 if not next_message.get("tool_calls") and turn_metrics.get(NUM_LLM_CALLS, 0) > 0:
+                    if os.environ.get("CAR_BENCH_RUN_DIR"):
+                        turn_metrics["_reported_fields"] = reported_metric_fields
                     next_message["turn_metrics"] = turn_metrics
 
                 # Update AgentState cost/latency totals
@@ -770,6 +774,7 @@ def build_args_from_config(config: dict, task_type: str) -> argparse.Namespace:
         num_tasks=config.get(f"tasks_{task_type}_num_tasks", -1),
         task_id_filter=config.get(f"tasks_{task_type}_task_id_filter", None),
         num_trials=config.get("num_trials", 1),
+        max_steps=config.get("max_steps", 40),
         max_concurrency=1,  # Sequential to avoid overloading agent under test
         # User simulator settings
         user_strategy="llm",
@@ -815,6 +820,18 @@ class CARBenchEvaluator(EvaluatorAgent):
         return True, "ok"
 
     async def run_eval(self, req: EvalRequest, updater: TaskUpdater) -> None:
+        if req.run_context is not None:
+            from competition.evaluator_run import run_competition_evaluation
+
+            await run_competition_evaluation(
+                req=req,
+                updater=updater,
+                logger=logger.bind(role="evaluator", context="competition"),
+                agent_factory_builder=create_remote_agent_factory,
+                args_builder=build_args_from_config,
+            )
+            return
+
         eval_logger = logger.bind(role="evaluator", context="eval")
         eval_logger.info(
             "Starting CAR-bench evaluation",

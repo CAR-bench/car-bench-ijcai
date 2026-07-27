@@ -14,6 +14,7 @@ dependencies = [
     "loguru>=0.7.0",
     "pydantic>=2.11.9",
     "python-dotenv>=1.1.1",
+    "tomli-w>=1.0.0",
     "uvicorn>=0.35.0",
 ]
 
@@ -22,6 +23,7 @@ track-1-agent = [
     "google-adk>=1.14.1",
     "google-genai>=1.36.0",
     "litellm>=1.85.1",
+    "google-cloud-aiplatform>=1.38",
 ]
 track-2-agent = [
     "cerebras-cloud-sdk>=1.50.0",
@@ -33,6 +35,7 @@ car-bench-evaluator = [
 
 [project.scripts]
 car-bench-run = "agentbeats.run_scenario:main"
+car-bench-competition = "competition.cli:main"
 
 [dependency-groups]
 dev = [
@@ -50,4 +53,4 @@ car-bench = { path = "third_party/car-bench" }
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentbeats"]
+packages = ["src/agentbeats", "src/competition"]

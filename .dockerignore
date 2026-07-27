@@ -2,6 +2,8 @@
 .DS_Store
 .python-version
 .venv
+hidden_dataset
+competition_results
 **/__pycache__
 **/*.pyc
 

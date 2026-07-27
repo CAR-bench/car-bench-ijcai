@@ -10,7 +10,7 @@ COPY --chown=carbench:carbench third_party third_party
 
 RUN \
     --mount=type=cache,target=/home/carbench/.cache/uv,uid=1000 \
-    uv sync --no-install-project --no-dev --extra track-2-agent --extra car-bench-evaluator
+    uv sync --no-install-project --no-dev --extra track-2-agent
 
 FROM ghcr.io/astral-sh/uv:python3.12-trixie
 
@@ -19,11 +19,12 @@ USER carbench
 WORKDIR /home/carbench/app
 
 COPY --from=python-deps --chown=carbench:carbench /home/carbench/app/.venv .venv
-COPY --chown=carbench:carbench src src
+COPY --chown=carbench:carbench src/logging_utils.py src/tool_call_types.py src/turn_metrics.py src/
+COPY --chown=carbench:carbench src/track_2_agent_under_test_cerebras src/track_2_agent_under_test_cerebras
 
 ENV PYTHONPATH=/home/carbench/app/src
 ENV TRACK2_EXECUTOR_MODEL=gpt-oss-120b
-ENV TRACK2_EXECUTOR_REASONING_EFFORT=medium
+ENV TRACK2_MAX_COMPLETION_TOKENS=2048
 
 ENTRYPOINT [".venv/bin/python", "src/track_2_agent_under_test_cerebras/server.py"]
 CMD ["--host", "0.0.0.0"]

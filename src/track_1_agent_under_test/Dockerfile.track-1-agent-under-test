@@ -19,9 +19,11 @@ USER carbench
 WORKDIR /home/carbench/app
 
 COPY --from=python-deps --chown=carbench:carbench /home/carbench/app/.venv .venv
-COPY --chown=carbench:carbench src src
+COPY --chown=carbench:carbench src/logging_utils.py src/tool_call_types.py src/turn_metrics.py src/
+COPY --chown=carbench:carbench src/track_1_agent_under_test src/track_1_agent_under_test
 
 ENV PYTHONPATH=/home/carbench/app/src
+ENV AGENT_LLM=gpt-5.6-sol
 
 ENTRYPOINT [".venv/bin/python", "src/track_1_agent_under_test/server.py"]
 CMD ["--host", "0.0.0.0"]

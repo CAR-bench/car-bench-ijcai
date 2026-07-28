@@ -21,7 +21,7 @@ WORKDIR /home/carbench/app
 COPY --from=python-deps --chown=carbench:carbench /home/carbench/app/.venv .venv
 COPY --chown=carbench:carbench src src
 
-ENV PYTHONPATH=/home/carbench/app/src
+ENV PYTHONPATH=/home/carbench/app
 
 ENTRYPOINT [".venv/bin/python", "src/track_1_agent_under_test/server.py"]
 CMD ["--host", "0.0.0.0"]

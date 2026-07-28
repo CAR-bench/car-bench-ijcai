@@ -1,0 +1,24 @@
+[evaluator]
+image = "ghcr.io/car-bench/car-bench-evaluator:latest"
+
+[evaluator.env]
+GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY}"
+LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
+
+[agent_under_test]
+image = "ghcr.io/farrukh-noor-khan/car-bench-agent@sha256:3b6afd28b4da70e3450f4139546cf9142bad4e11cca14fe5813d1ca40190fe26"
+
+[agent_under_test.env]
+AGENT_LLM = "${AGENT_LLM:-gemini/gemini-3.5-flash}"
+AGENT_API_BASE = "${AGENT_API_BASE:-}"
+AGENT_API_KEY = "${AGENT_API_KEY:?Set AGENT_API_KEY}"
+AGENT_TEMPERATURE = "${AGENT_TEMPERATURE:-0.0}"
+LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}"
+
+[config]
+num_trials = 3
+task_split = "hidden"
+tasks_base_num_tasks = -1
+tasks_hallucination_num_tasks = -1
+tasks_disambiguation_num_tasks = -1
+max_steps = 50

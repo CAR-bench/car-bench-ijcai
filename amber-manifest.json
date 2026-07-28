@@ -10,7 +10,7 @@
     "protocol": "A2A",
     "endpoint": {
       "type": "docker",
-      "image": "ghcr.io/farrukh-noor-khan/car-bench-agent@sha256:9728694b55dbb72218ba9b7662591f2e8ad66045989fb8ada81d59041477af22"
+      "image": "ghcr.io/farrukh-noor-khan/car-bench-agent@sha256:3b6afd28b4da70e3450f4139546cf9142bad4e11cca14fe5813d1ca40190fe26"
     },
     "capabilities": {
       "tool_use": true,

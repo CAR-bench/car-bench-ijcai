@@ -1,3 +1,48 @@
+# CAR-bench Submission — Team Sid&Sanika (Sanika Killekar & Siddharth Mohapatra)
+
+**Track:** 1 (Open Track) · **Model:** Gemini 2.5 Flash (non-thinking) via LiteLLM ·
+
+## What we built
+
+Rather than relying on the underlying LLM's tool-calling behavior alone, our agent (`src/track_1_agent_under_test/car_bench_agent.py`) wraps every proposed tool call in a **deterministic policy layer**: a fixed, ordered sequence of code checks that inspects each proposed action before it reaches the evaluator, and either passes it through unchanged, corrects it, defers it, or replaces it with a refusal or clarifying question.
+
+The full check sequence:
+
+| Check | What it does |
+|---|---|
+| **Tool Existence & Confirmation** | Rejects calls to tools removed for a task (Hallucination); gates consequential actions (e.g. sending an email) behind explicit user confirmation |
+| **Prerequisite Injection** | Auto-injects required state lookups before a dependent action (e.g. checking weather before opening the sunroof), batched to avoid extra round-trips |
+| **Missing Information Detection** | Asks for exactly the missing required parameters; blocks actions that depend on a GET-result field that was never actually confirmed |
+| **Preference-Aware Auto-Injection** | Looks up stored user preferences before acting, but only when the proposed call is otherwise incomplete — an explicit user instruction always outranks a stored default |
+| **Mutual Exclusion & Parallel-Call Constraints** | Blocks conflicting actions (e.g. high beams while fog lights are on); prevents multiple navigation-edit tools from firing in the same turn |
+| **Disambiguation (two-stage)** | A deterministic cache resolves common vague requests at zero extra inference cost; an EVPI-based procedure generates and scores candidate clarifying questions for genuinely novel ambiguity, run at temperature 0.0 for trial-to-trial consistency |
+| **Post-Action Side Effects** | Auto-appends policy-mandated follow-up actions (e.g. closing open windows when AC turns on) |
+| **Policy-Compliance Verifier** | A self-consistency-sampled judge catches false completion claims and unmet semantic policies in the agent's final response |
+
+A lightweight Reflexion-style memory also carries lessons learned from any caught policy violation forward to later tasks in the same run, with no weight updates or code changes required.
+
+## Why this design
+
+CAR-bench's headline metric, **Pass³**, only credits a task if the agent behaves identically correctly across three independent trials, not just once. Native LLM tool-calling has no inherent guarantee of that kind of consistency; our approach treats the LLM strictly as a proposal mechanism and moves every deterministic or policy-derivable decision into a layer the model doesn't need to get right on its own.
+
+## Results (public split, vs. the CAR-bench paper's own baseline for the identical model)
+
+| Task Type | N | Baseline Pass³ | Ours | Δ |
+|---|---|---|---|---|
+| Base | 50 | 48% | 46% | −2 pts |
+| Hallucination | 150 | 22% | 42% | +20 pts |
+| Disambiguation | 25 | 22% | 36% | +14 pts |
+
+Hidden-test-set scores are withheld per the competition's reporting rules; see [`report/report.pdf`](report/report.pdf) for the full methodology, validation discussion, and honestly-reported limitations.
+
+## Cost & latency
+
+Roughly **$0.01 and 16.5 seconds of added latency per task** (measured over a completed 150-task, 3-trial Hallucination run), using ~44,500 tokens and 4.4 A2A turns on average.
+
+---
+
+*Everything below this point is the original CAR-bench Challenge starter-kit documentation.*
+
 # IJCAI-ECAI 2026 Competition
 # CAR-bench: Building Reliable LLM Agents Under Real-World Uncertainty
 

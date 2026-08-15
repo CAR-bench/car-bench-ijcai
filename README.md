@@ -33,11 +33,11 @@ CAR-bench's headline metric, **Pass³**, only credits a task if the agent behave
 | Hallucination | 150 | 22% | 42% | +20 pts |
 | Disambiguation | 25 | 22% | 36% | +14 pts |
 
-Hidden-test-set scores are withheld per the competition's reporting rules; see [`report/report.pdf`](report/report.pdf) for the full methodology, validation discussion, and honestly-reported limitations.
+Hidden-test-set scores are withheld per the competition's reporting rules.
 
 ## Cost & latency
 
-Roughly **$0.01 and 16.5 seconds of added latency per task** (measured over a completed 150-task, 3-trial Hallucination run), using ~44,500 tokens and 4.4 A2A turns on average.
+Roughly $0.01 and 16.5 seconds of total LLM-induced latency per task (measured over a completed 150-task, 3-trial Hallucination run), using ~44,500 tokens and 4.4 A2A turns on average.
 
 ---
 

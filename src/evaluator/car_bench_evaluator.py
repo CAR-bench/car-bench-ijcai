@@ -10,6 +10,7 @@ This agent:
 """
 import argparse
 import asyncio
+import copy
 import json
 import os
 import re
@@ -106,6 +107,55 @@ def _tool_parameter_schemas(
         if isinstance(name, str) and isinstance(parameters, dict):
             schemas[name] = parameters
     return schemas
+
+
+def _tools_for_remote_agent(
+    tools_info: List[Dict[str, Any]] | None,
+) -> List[Dict[str, Any]]:
+    """Return a provider-compatible, non-mutating participant tool contract."""
+
+    remote_tools: List[Dict[str, Any]] = []
+    for tool in tools_info or []:
+        if not isinstance(tool, dict):
+            continue
+
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name") == "think":
+            continue
+
+        normalized_tool = copy.deepcopy(tool)
+        normalized_function = normalized_tool.get("function")
+        if isinstance(normalized_function, dict):
+            # Some CAR-bench tool definitions historically placed this JSON
+            # Schema keyword on the function wrapper instead of `parameters`.
+            # OpenAI-compatible function wrappers only accept name,
+            # description, parameters, and strict.
+            wrapper_additional_properties = normalized_function.pop(
+                "additionalProperties",
+                None,
+            )
+            parameters = normalized_function.get("parameters")
+            if isinstance(parameters, dict):
+                properties = parameters.get("properties")
+                if isinstance(properties, dict):
+                    misplaced_additional_properties = properties.get(
+                        "additionalProperties"
+                    )
+                    if isinstance(misplaced_additional_properties, bool):
+                        properties.pop("additionalProperties")
+                        parameters.setdefault(
+                            "additionalProperties",
+                            misplaced_additional_properties,
+                        )
+                if isinstance(wrapper_additional_properties, bool):
+                    parameters.setdefault(
+                        "additionalProperties",
+                        wrapper_additional_properties,
+                    )
+
+        remote_tools.append(normalized_tool)
+
+    return remote_tools
 
 
 def _normalize_value_for_schema(value: Any, schema: Any) -> Any:
@@ -323,6 +373,8 @@ def create_remote_agent_factory(agent_url: str):
             def generate_next_message(self, state: AgentState, tools_info: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], AgentState]:
                 """Generate next message by calling remote agent under test."""
                 import asyncio
+
+                tools_info = _tools_for_remote_agent(tools_info)
 
                 # Collect trailing tool result messages (there may be multiple from parallel tool calls)
                 tool_result_messages = []

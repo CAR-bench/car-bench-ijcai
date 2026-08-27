@@ -31,6 +31,7 @@ from competition.evaluator_run import _trial_seed
 from competition.scenario import (
     ScenarioValidationError,
     load_and_validate_scenario,
+    resolve_docker_image,
 )
 from competition.storage import RunLock, RunStorageError, RunStore, atomic_write_json
 
@@ -352,6 +353,25 @@ class CompetitionRunnerTest(unittest.TestCase):
                 "Official hidden config mismatch",
             ):
                 load_and_validate_scenario(path)
+
+    @mock.patch("competition.scenario.subprocess.run")
+    def test_resolve_docker_image_accepts_images_without_labels(self, run):
+        image = f"ghcr.io/example/team@sha256:{'a' * 64}"
+        run.return_value = SimpleNamespace(
+            stdout=(
+                f'"sha256:{"b" * 64}"|["{image}"]|'
+                '"2026-07-13T13:51:03Z"|null'
+            )
+        )
+
+        resolved = resolve_docker_image(image, pull=False)
+
+        self.assertEqual(resolved["resolved"], image)
+        self.assertEqual(resolved["version"], f"sha256:{'a' * 64}")
+        self.assertEqual(resolved["version_source"], "image_digest")
+        self.assertIsNone(resolved["revision"])
+        inspect_command = run.call_args.args[0]
+        self.assertIn('index .Config "Labels"', inspect_command[3])
 
     def test_compose_mounts_hidden_data_and_results_only_into_evaluator(self):
         with tempfile.TemporaryDirectory() as temp:

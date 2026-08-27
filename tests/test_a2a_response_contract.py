@@ -21,6 +21,7 @@ from evaluator.car_bench_evaluator import (
     _parse_tool_calls_data,
     _sum_successful_llm_time_seconds,
     _tool_parameter_schemas,
+    _tools_for_remote_agent,
 )
 from car_bench.envs.base import Env
 from car_bench.envs.tool_execution_error_evaluator import (
@@ -176,6 +177,80 @@ def fake_task() -> Task:
 
 
 class A2AResponseContractTest(unittest.TestCase):
+    def test_remote_agent_tools_exclude_think_without_mutating_source(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "think",
+                    "description": "No-op scratchpad.",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "planning_tool",
+                    "description": "Maintain a plan.",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_fan_speed",
+                    "description": "Set fan speed.",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ]
+
+        filtered = _tools_for_remote_agent(tools)
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in filtered],
+            ["planning_tool", "set_fan_speed"],
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["think", "planning_tool", "set_fan_speed"],
+        )
+
+    def test_remote_agent_tools_normalize_additional_properties_location(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculate_datetime",
+                    "description": "Add time to a datetime.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "hours": {"type": "number"},
+                            "additionalProperties": False,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            }
+        ]
+
+        normalized = _tools_for_remote_agent(tools)
+        normalized_function = normalized[0]["function"]
+        normalized_parameters = normalized_function["parameters"]
+
+        self.assertNotIn("additionalProperties", normalized_function)
+        self.assertNotIn(
+            "additionalProperties",
+            normalized_parameters["properties"],
+        )
+        self.assertIs(normalized_parameters["additionalProperties"], False)
+        self.assertIn("additionalProperties", tools[0]["function"])
+        self.assertIn(
+            "additionalProperties",
+            tools[0]["function"]["parameters"]["properties"],
+        )
+
     def test_track_1_gpt_5_6_sol_chat_tools_disable_reasoning(self) -> None:
         kwargs = track_1_completion_kwargs(
             model="gpt-5.6-sol",

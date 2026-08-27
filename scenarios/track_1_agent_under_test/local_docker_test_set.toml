@@ -7,8 +7,11 @@ image = "ghcr.io/car-bench/car-bench-evaluator:latest"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}", LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}" }
 
 [agent_under_test]
+name = "track1-baseline-gpt-5.6-sol"
+result_label = "Track 1 baseline — gpt-5.6-sol Chat Completions"
+result_model = "gpt-5.6-sol"
 build = { context = ".", dockerfile = "src/track_1_agent_under_test/Dockerfile.track-1-agent-under-test" }
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}", OPENAI_API_KEY = "${OPENAI_API_KEY:-}", GEMINI_API_KEY = "${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}", AGENT_LLM = "${AGENT_LLM:-gemini/gemini-2.5-flash}", AGENT_TEMPERATURE = "${AGENT_TEMPERATURE:-0.0}", LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}" }
+env = { OPENAI_API_KEY = "${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}", LOGURU_LEVEL = "${LOGURU_LEVEL:-INFO}" }
 
 [config]
 num_trials = 3

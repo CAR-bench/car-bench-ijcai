@@ -214,7 +214,7 @@ def resolve_docker_image(image: str, *, pull: bool = True) -> dict[str, Any]:
             "image",
             "inspect",
             "--format={{json .Id}}|{{json .RepoDigests}}|"
-            "{{json .Created}}|{{json .Config.Labels}}",
+            '{{json .Created}}|{{json (index .Config "Labels")}}',
             image,
         ],
         check=True,

@@ -24,4 +24,9 @@ scenarios/**/docker-compose.yml
 scenarios/**/a2a-scenario.toml
 hidden_dataset/
 competition_results/
+competition_results_secondary_runs/
 submissions/*
+
+review_app/
+.tmp/
+.codex_tmp
